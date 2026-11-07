@@ -44,7 +44,10 @@ import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 import { getVendorName, readDomainSession, writeDomainSession, type DomainSession } from "@/lib/domain-session";
 
-const adminUrl = String(process.env.NEXT_PUBLIC_ADMIN_URL || "http://localhost:5173").replace(/\/$/, "");
+const adminUrl = String(
+  process.env.NEXT_PUBLIC_ADMIN_URL ||
+    (process.env.NODE_ENV === "production" ? "https://demo.sellerslogin.com" : "http://localhost:5173"),
+).replace(/\/$/, "");
 
 const navigation = [
   { label: "Domain Dashboard", icon: House },
