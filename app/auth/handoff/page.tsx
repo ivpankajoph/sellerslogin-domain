@@ -41,7 +41,7 @@ export default function AuthHandoffPage() {
             <Globe2 className="size-6 animate-pulse" />
           </div>
           <h1 className="mt-4 text-lg font-semibold">Opening Domain workspace</h1>
-          <p className="mt-1 text-sm text-muted-foreground">Signing you in securely with SellersLogin…</p>
+          <p className="mt-1 text-sm text-muted-foreground">Signing you in Securely with SellersLogin…</p>
         </CardContent>
       </Card>
     </main>
