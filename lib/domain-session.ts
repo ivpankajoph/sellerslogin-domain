@@ -44,3 +44,38 @@ export function getVendorName(user?: DomainUser | null) {
   ];
   return fields.map((value) => String(value || "").trim()).find(Boolean) || "Vendor";
 }
+
+function normalizeRole(value: unknown) {
+  return String(value || "").trim().toLowerCase().replace(/[\s_-]/g, "");
+}
+
+function readTokenPayload(token?: string) {
+  if (typeof window === "undefined" || !token) return null;
+  try {
+    const payload = token.split(".")[1];
+    if (!payload) return null;
+    const base64 = payload.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(payload.length / 4) * 4, "=");
+    return JSON.parse(window.atob(base64)) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+export function getDomainSessionRole(session?: DomainSession | null) {
+  const tokenPayload = readTokenPayload(session?.token);
+  const candidates = [
+    session?.user?.role,
+    session?.user?.user_role,
+    session?.user?.userType,
+    session?.user?.user_type,
+    tokenPayload?.role,
+    session?.user?.account_type,
+    session?.user?.accountType,
+    tokenPayload?.account_type,
+  ].map(normalizeRole);
+
+  if (candidates.some((value) => value === "superadmin" || value === "envsuperadmin")) return "superadmin";
+  if (candidates.includes("admin")) return "admin";
+  if (candidates.includes("vendor")) return "vendor";
+  return candidates.find(Boolean) || "";
+}
