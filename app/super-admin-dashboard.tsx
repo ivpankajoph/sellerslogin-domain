@@ -84,6 +84,13 @@ const adminNavigation = [
   { label: "Settings", href: "/admin/settings", icon: Settings },
 ];
 
+const pricingNavigation = [
+  { label: "Pricing overview", href: "/admin/pricing" },
+  { label: "Domain prices", href: "/admin/pricing/domains" },
+  { label: "Special pricing rules", href: "/admin/pricing/rules" },
+  { label: "Offers & discounts", href: "/admin/pricing/offers" },
+];
+
 export function SuperAdminDashboard({
   adminUrl,
   darkMode,
@@ -94,9 +101,11 @@ export function SuperAdminDashboard({
   onToggleTheme,
 }: SuperAdminDashboardProps) {
   const pathname = usePathname();
-  const activeItem = adminNavigation.find((item) => item.href === pathname)?.label
+  const pricingPathActive = pathname.startsWith("/admin/pricing");
+  const activeItem = (pricingPathActive ? "Pricing" : adminNavigation.find((item) => item.href === pathname)?.label)
     || (pathname === "/" ? "Overview" : "Overview");
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [pricingMenuOpen, setPricingMenuOpen] = useState(false);
   const [dashboard, setDashboard] = useState<DashboardData | null>(null);
   const [recentOrders, setRecentOrders] = useState<DomainOrder[]>([]);
   const [pendingOrders, setPendingOrders] = useState<number | null>(null);
@@ -112,6 +121,7 @@ export function SuperAdminDashboard({
 
   useEffect(() => {
     const controller = new AbortController();
+    let active = true;
     const read = <T,>(path: string) => domainApi<T>(token, path, { signal: controller.signal });
 
     setLoading(true);
@@ -123,19 +133,25 @@ export function SuperAdminDashboard({
       read<{ total: number }>("/v1/admin/domain/orders?page=1&limit=1&status=RECONCILIATION_REQUIRED"),
     ])
       .then(([dashboardResult, ordersResult, pendingResult, reconciliationResult]) => {
+        if (!active) return;
         if (dashboardResult.status === "fulfilled") setDashboard(dashboardResult.value);
         if (ordersResult.status === "fulfilled") setRecentOrders(Array.isArray(ordersResult.value?.items) ? ordersResult.value.items : []);
         const providerPending = pendingResult.status === "fulfilled" ? Number(pendingResult.value.total || 0) : 0;
         const reconciliation = reconciliationResult.status === "fulfilled" ? Number(reconciliationResult.value.total || 0) : 0;
         if (pendingResult.status === "fulfilled" || reconciliationResult.status === "fulfilled") setPendingOrders(providerPending + reconciliation);
         if (reconciliationResult.status === "fulfilled") setReconciliationOrders(reconciliation);
-        if ([dashboardResult, ordersResult, pendingResult, reconciliationResult].every((result) => result.status === "rejected")) {
+        if (dashboardResult.status === "fulfilled") {
+          setLoadError("");
+        } else if ([dashboardResult, ordersResult, pendingResult, reconciliationResult].every((result) => result.status === "rejected")) {
           setLoadError("Live administration data is temporarily unavailable.");
         }
       })
-      .finally(() => setLoading(false));
+      .finally(() => { if (active) setLoading(false); });
 
-    return () => controller.abort();
+    return () => {
+      active = false;
+      controller.abort();
+    };
   }, [token]);
 
   const summaryCards = useMemo(() => [
@@ -218,7 +234,26 @@ export function SuperAdminDashboard({
         <div className="flex-1 overflow-y-auto px-3 py-2">
           <p className="mb-2 px-2 text-xs font-medium text-muted-foreground">DOMAIN ADMIN</p>
           <nav className="space-y-1">
-            {adminNavigation.map((item) => (
+            {adminNavigation.map((item) => item.label === "Pricing" ? (
+              <div key={item.label}>
+                <Button
+                  type="button"
+                  variant={pricingPathActive ? "secondary" : "ghost"}
+                  className={cn("w-full justify-start", pricingPathActive && "bg-primary/20")}
+                  onClick={() => setPricingMenuOpen((value) => !value)}
+                  aria-expanded={pricingMenuOpen || pricingPathActive}
+                >
+                  <item.icon />
+                  <span className="flex-1 text-left">{item.label}</span>
+                  <ChevronDown className={cn("transition-transform", (pricingMenuOpen || pricingPathActive) && "rotate-180")} />
+                </Button>
+                {(pricingMenuOpen || pricingPathActive) && <div className="mt-1 space-y-1 border-l pl-4 ml-4">{pricingNavigation.map((child) => (
+                  <Button key={child.href} asChild variant={pathname === child.href ? "secondary" : "ghost"} size="sm" className={cn("w-full justify-start", pathname === child.href && "bg-primary/15")}>
+                    <Link href={child.href} onClick={() => setSidebarOpen(false)}>{child.label}</Link>
+                  </Button>
+                ))}</div>}
+              </div>
+            ) : (
               <Button
                 key={item.label}
                 asChild
