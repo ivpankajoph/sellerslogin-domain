@@ -220,8 +220,15 @@ function availabilityLabel(status: string) {
     case "ERROR": return "Availability check failed";
     case "NONE":
     case "UNKNOWN":
-    default: return "Availability unavailable";
+    default: return "Could not verify availability";
   }
+}
+
+function markDomainsUnverified(current: SearchResult[], domainNames: string[]): SearchResult[] {
+  const targets = new Set(domainNames);
+  return current.map((item) => targets.has(item.domainName) && item.liveVerified !== true
+    ? { ...item, status: "UNKNOWN", liveVerified: false, checkFailed: true }
+    : item);
 }
 
 function mergeSearchResults(current: SearchResult[], incoming: SearchResult[]): SearchResult[] {
@@ -230,7 +237,7 @@ function mergeSearchResults(current: SearchResult[], incoming: SearchResult[]): 
     const update = updates.get(item.domainName);
     if (!update) return item;
     if (update.liveVerified !== true && item.estimated) {
-      return { ...item, reason: update.reason, liveVerified: false, checkFailed: true };
+      return { ...item, status: "UNKNOWN", reason: update.reason, liveVerified: false, checkFailed: true };
     }
     const persistentBadges = (item.badges || []).filter((badge) => badge === "EXACT_MATCH");
     const liveBadges = [
@@ -270,7 +277,20 @@ function DomainSuggestionRows({ suggestions, selectedDomain, checkoutReady, pend
   pending: boolean;
   onSelect: (suggestion: SearchResult) => void;
 }) {
-  return <div className="divide-y">{suggestions.map((suggestion) => {
+  const displaySuggestions = suggestions
+    .filter((suggestion) => !suggestion.checkFailed && !["UNKNOWN", "NONE", "ERROR"].includes(suggestion.status))
+    .map((suggestion, index) => ({ suggestion, index }))
+    .sort((left, right) => {
+      const rank = (item: SearchResult) => {
+        if (item.status === "AVAILABLE" && item.liveVerified === true) return 0;
+        if (item.liveVerified === true) return 1;
+        if (item.status === "PREVIEW") return 2;
+        return 3;
+      };
+      return rank(left.suggestion) - rank(right.suggestion) || left.index - right.index;
+    })
+    .map(({ suggestion }) => suggestion);
+  return <div className="divide-y">{displaySuggestions.map((suggestion) => {
     const available = suggestion.status === "AVAILABLE" && suggestion.liveVerified === true;
     const preview = suggestion.status === "PREVIEW";
     const selected = selectedDomain === suggestion.domainName;
@@ -280,7 +300,6 @@ function DomainSuggestionRows({ suggestions, selectedDomain, checkoutReady, pend
         <div className="flex flex-wrap items-center gap-2">
           <p className="font-medium">{suggestion.domainName}</p>
           <Badge variant={available ? "secondary" : "outline"}>{availabilityLabel(suggestion.status)}</Badge>
-          {smartBadges.includes("EXACT_MATCH") && suggestion.status !== "NOTAVAILABLE" && <Badge variant="outline">Exact match</Badge>}
           {smartBadges.includes("PREMIUM") && <Badge variant="outline">Premium</Badge>}
           {smartBadges.includes("GREAT_ALTERNATIVE") && <Badge>Great alternative</Badge>}
           {suggestion.promotion && <Badge>Multi-year offer</Badge>}
@@ -289,7 +308,7 @@ function DomainSuggestionRows({ suggestions, selectedDomain, checkoutReady, pend
         {suggestion.renewalPricing?.customerAmount != null && <p className="mt-1 text-xs text-muted-foreground">Renews at {formatDomainAmount(suggestion.renewalPricing.customerAmount, suggestion.renewalPricing.customerCurrency)} / year</p>}
       </div>
       <div className="flex shrink-0 flex-col items-stretch gap-2 sm:min-w-52 sm:items-end">
-        {(available || preview) && (suggestion.discountedPrice != null || suggestion.pricing.customerAmount != null) && <div className="text-left sm:text-right">
+        {(available || preview || suggestion.checkFailed) && (suggestion.discountedPrice != null || suggestion.pricing.customerAmount != null) && <div className="text-left sm:text-right">
           {suggestion.promotion && suggestion.originalPrice != null && <span className="mr-2 text-sm text-muted-foreground line-through">{formatDomainAmount(suggestion.originalPrice, suggestion.promotion.currency)}</span>}
           <span className="font-semibold">{formatDomainAmount(suggestion.discountedPrice ?? suggestion.pricing.customerAmount, suggestion.promotion?.currency || suggestion.pricing.customerCurrency)}</span>
           <p className="text-xs text-muted-foreground">{suggestion.promotion ? "for the first year" : `/ ${suggestion.period} ${suggestion.period === 1 ? "year" : "years"}`}</p>
@@ -315,23 +334,51 @@ export function SearchAndBuy({ token }: { token: string }) {
     if (currentQuery.length < 2) { setSuggestions([]); setSearching(false); return; }
     let active = true;
     const controller = new AbortController();
+    let checkingDeadline: number | undefined;
     const isCurrent = () => active && latestSearchId.current === searchId;
-    const checkInBatches = async (domainNames: string[], batchSize: number) => {
-      const uniqueNames = [...new Set(domainNames.filter(Boolean))];
-      for (let index = 0; index < uniqueNames.length; index += batchSize) {
-        if (!isCurrent()) return;
-        try {
-          const response = await domainApi<StagedSearchResponse>(token, "/v1/domain/search/smart/retry", {
-            method: "POST",
-            signal: controller.signal,
-            body: JSON.stringify({ domainNames: uniqueNames.slice(index, index + batchSize) }),
-          });
-          if (isCurrent()) setSuggestions((current) => mergeSearchResults(current, response.results || []));
-        } catch (batchCause) {
-          if (batchCause instanceof Error && batchCause.name === "AbortError") return;
-          // One slow provider batch must not block or clear the other preview cards.
+    const checkBatchQueue = async (initialJobs: Array<{ domainNames: string[]; attempt: number; readyAt: number }>) => {
+      const jobs = [...initialJobs];
+      let cursor = 0;
+      const worker = async () => {
+        while (isCurrent() && cursor < jobs.length) {
+          const job = jobs[cursor++];
+          const delay = Math.max(0, job.readyAt - Date.now());
+          if (delay) await new Promise((resolve) => window.setTimeout(resolve, delay));
+          if (!isCurrent()) return;
+          let unresolved = job.domainNames;
+          let shouldRetry = false;
+          try {
+            const response = await domainApi<StagedSearchResponse>(token, "/v1/domain/search/smart/retry", {
+              method: "POST",
+              signal: AbortSignal.any([controller.signal, AbortSignal.timeout(25_000)]),
+              body: JSON.stringify({ domainNames: job.domainNames }),
+            });
+            if (!isCurrent()) return;
+            setSuggestions((current) => mergeSearchResults(current, response.results || []));
+            const verified = new Set((response.results || []).filter((item) => item.liveVerified === true).map((item) => item.domainName));
+            unresolved = job.domainNames.filter((domainName) => !verified.has(domainName));
+            shouldRetry = unresolved.length > 0;
+          } catch (batchCause) {
+            if (controller.signal.aborted) return;
+            shouldRetry = true;
+          }
+          if (unresolved.length && isCurrent()) {
+            setSuggestions((current) => markDomainsUnverified(current, unresolved));
+          }
+          if (shouldRetry && job.attempt === 0 && isCurrent()) {
+            jobs.push({ domainNames: unresolved, attempt: 1, readyAt: Date.now() + 4_000 });
+          }
         }
+      };
+      await Promise.allSettled([worker(), worker()]);
+    };
+    const buildJobs = (domainNames: string[], batchSize: number) => {
+      const uniqueNames = [...new Set(domainNames.filter(Boolean))];
+      const jobs: Array<{ domainNames: string[]; attempt: number; readyAt: number }> = [];
+      for (let index = 0; index < uniqueNames.length; index += batchSize) {
+        jobs.push({ domainNames: uniqueNames.slice(index, index + batchSize), attempt: 0, readyAt: 0 });
       }
+      return jobs;
     };
     const timer = window.setTimeout(async () => {
       setSearching(true);
@@ -341,10 +388,14 @@ export function SearchAndBuy({ token }: { token: string }) {
         setSuggestions(preview.results || []);
         const visibleDomains = (preview.results || []).slice(0, 6).map((item) => item.domainName);
         const backgroundDomains = (preview.results || []).slice(6).map((item) => item.domainName);
-        await checkInBatches(visibleDomains, 2);
-        if (!isCurrent()) return;
+        checkingDeadline = window.setTimeout(() => {
+          if (isCurrent()) setSuggestions((current) => markDomainsUnverified(current, current.filter((item) => item.status === "PREVIEW").map((item) => item.domainName)));
+        }, 3_000);
         setSearching(false);
-        void checkInBatches(backgroundDomains, 6);
+        void checkBatchQueue([
+          ...buildJobs(visibleDomains, 2),
+          ...buildJobs(backgroundDomains, 6),
+        ]);
       } catch (cause) {
         if (cause instanceof Error && cause.name === "AbortError") return;
         if (isCurrent()) setSearchError(cause instanceof Error ? cause.message : "We couldn't check availability right now. Please try again in a moment.");
@@ -352,7 +403,7 @@ export function SearchAndBuy({ token }: { token: string }) {
         if (isCurrent()) setSearching(false);
       }
     }, 100);
-    return () => { active = false; controller.abort(); window.clearTimeout(timer); };
+    return () => { active = false; controller.abort(); window.clearTimeout(timer); if (checkingDeadline) window.clearTimeout(checkingDeadline); };
   }, [query, retryVersion, token]);
   const searchDomain = (event: FormEvent) => { event.preventDefault(); if (!searching && searchQuery.length >= 2) setRetryVersion((value) => value + 1); };
   const createQuote = async (selected: SearchResult) => {
