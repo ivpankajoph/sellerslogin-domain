@@ -39,7 +39,8 @@ export async function domainApi<T>(
       headers,
       cache: "no-store",
     });
-  } catch {
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") throw error;
     throw new DomainApiError(
       "The domain service is temporarily unavailable. Please try again shortly.",
       0,
@@ -48,7 +49,8 @@ export async function domainApi<T>(
   }
   const payload = await response.json().catch(() => ({}));
   if (!response.ok || !payload?.success) {
-    if (response.status === 401 && typeof window !== "undefined") {
+    const providerAuthenticationFailure = response.status === 401 && payload?.code === "DOMAIN_REQUEST_FAILED";
+    if (response.status === 401 && !providerAuthenticationFailure && typeof window !== "undefined") {
       window.localStorage.removeItem("sellerslogin-domain-session");
       window.location.replace("/login");
     }

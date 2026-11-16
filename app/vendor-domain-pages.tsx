@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowRight,
   CheckCircle2,
@@ -51,12 +51,21 @@ type SearchResult = {
   domainName: string;
   unicodeDomainName?: string;
   status: string;
+  liveVerified?: boolean;
+  estimated?: boolean;
+  checkFailed?: boolean;
+  reason?: string | null;
   isPremium: boolean;
   isDocumentRequired: boolean;
   period: number;
-  pricing: { customerAmount: number | null; customerCurrency: string | null };
+  pricing: { customerAmount: number | null; customerCurrency: string | null; regularAmount?: number | null; discountAmount?: number; taxCollectionMode?: string; taxRatePercent?: number; taxAmount?: number };
+  badges?: Array<"EXACT_MATCH" | "PREMIUM" | "GREAT_ALTERNATIVE">;
+  originalPrice?: number | null;
+  discountedPrice?: number | null;
+  renewalPricing?: { customerAmount: number | null; customerCurrency: string | null } | null;
   promotion?: { campaignId: string; name: string; firstYearPrice: number; additionalYearPrice: number; requiredYears: number; bundleSubtotal: number; currency: string } | null;
 };
+type StagedSearchResponse = { results: SearchResult[]; failedDomains?: string[]; partial?: boolean };
 type Quote = {
   quoteId: string;
   domainName: string;
@@ -200,17 +209,96 @@ export function VendorOverview({ token }: { token: string }) {
 }
 
 const emptyContact = { firstName: "", lastName: "", companyName: "", eMail: "", address: "", city: "", state: "", postalCode: "", country: "IN", phoneCountryCode: "91", phone: "" };
-const liveSearchCache = new Map<string, { result: SearchResult; expiresAt: number }>();
 
-function buildDomainSuggestions(value: string) {
-  const cleaned = value.trim().toLowerCase().replace(/^https?:\/\//, "").split(/[/?#]/)[0].replace(/[^a-z0-9.-]/g, "").replace(/^\.+|\.+$/g, "");
-  if (cleaned.length < 2) return [];
-  const labels = cleaned.split(".").filter(Boolean);
-  const base = labels[0];
-  if (!base || base.length < 2) return [];
-  const alternatives = ["com", "in", "co.in", "net", "store"];
-  const candidates = cleaned.includes(".") ? [cleaned, ...alternatives.map((tld) => `${base}.${tld}`)] : alternatives.map((tld) => `${base}.${tld}`);
-  return [...new Set(candidates)].slice(0, 6);
+function availabilityLabel(status: string) {
+  switch (status) {
+    case "PREVIEW": return "Checking availability";
+    case "AVAILABLE": return "Available";
+    case "NOTAVAILABLE": return "Already taken";
+    case "UNSUPPORTEDTLD": return "Extension not supported";
+    case "INVALIDDOMAINNAME": return "Invalid domain name";
+    case "ERROR": return "Availability check failed";
+    case "NONE":
+    case "UNKNOWN":
+    default: return "Availability unavailable";
+  }
+}
+
+function mergeSearchResults(current: SearchResult[], incoming: SearchResult[]): SearchResult[] {
+  const updates = new Map(incoming.map((item) => [item.domainName, item]));
+  const merged = current.map((item) => {
+    const update = updates.get(item.domainName);
+    if (!update) return item;
+    if (update.liveVerified !== true && item.estimated) {
+      return { ...item, reason: update.reason, liveVerified: false, checkFailed: true };
+    }
+    const persistentBadges = (item.badges || []).filter((badge) => badge === "EXACT_MATCH");
+    const liveBadges = [
+      ...(update.badges || []),
+      ...(update.isPremium ? ["PREMIUM" as const] : []),
+    ];
+    return { ...update, badges: [...new Set([...persistentBadges, ...liveBadges])], checkFailed: false };
+  });
+  for (const item of incoming) if (!merged.some((value) => value.domainName === item.domainName)) merged.push(item);
+  const normalized: SearchResult[] = merged.map((item) => ({ ...item, badges: (item.badges || []).filter((badge) => badge !== "GREAT_ALTERNATIVE") }));
+  const preferred = { in: 0, com: 1, "co.in": 2 } as Record<string, number>;
+  const alternative = normalized
+    .filter((item) => item.status === "AVAILABLE" && item.liveVerified === true && !item.isPremium && !(item.badges || []).includes("EXACT_MATCH"))
+    .sort((left, right) => (preferred[left.domainName.split(".").slice(1).join(".")] ?? 3) - (preferred[right.domainName.split(".").slice(1).join(".")] ?? 3))[0];
+  return normalized.map((item) => item.domainName === alternative?.domainName
+    ? { ...item, badges: [...(item.badges || []), "GREAT_ALTERNATIVE" as const] }
+    : item);
+}
+
+function DomainSearchLoading() {
+  return <div role="status" aria-live="polite" aria-label="Checking domain availability" className="divide-y">
+    {[0, 1, 2, 3, 4].map((row) => <div key={row} className="flex items-center justify-between gap-4 p-4">
+      <div className="flex flex-1 items-center gap-3">
+        <div className="h-5 w-32 animate-pulse rounded bg-muted sm:w-44" />
+        <div className="h-6 w-20 animate-pulse rounded-full bg-muted" />
+      </div>
+      <div className="hidden h-9 w-40 animate-pulse rounded-md bg-muted sm:block" />
+    </div>)}
+    <span className="sr-only">Checking live availability and prices...</span>
+  </div>;
+}
+
+function DomainSuggestionRows({ suggestions, selectedDomain, checkoutReady, pending, onSelect }: {
+  suggestions: SearchResult[];
+  selectedDomain?: string;
+  checkoutReady: boolean;
+  pending: boolean;
+  onSelect: (suggestion: SearchResult) => void;
+}) {
+  return <div className="divide-y">{suggestions.map((suggestion) => {
+    const available = suggestion.status === "AVAILABLE" && suggestion.liveVerified === true;
+    const preview = suggestion.status === "PREVIEW";
+    const selected = selectedDomain === suggestion.domainName;
+    const smartBadges = suggestion.badges || [];
+    return <div key={suggestion.domainName} className="flex flex-col gap-4 p-4 sm:flex-row sm:items-center sm:justify-between">
+      <div className="min-w-0">
+        <div className="flex flex-wrap items-center gap-2">
+          <p className="font-medium">{suggestion.domainName}</p>
+          <Badge variant={available ? "secondary" : "outline"}>{availabilityLabel(suggestion.status)}</Badge>
+          {smartBadges.includes("EXACT_MATCH") && suggestion.status !== "NOTAVAILABLE" && <Badge variant="outline">Exact match</Badge>}
+          {smartBadges.includes("PREMIUM") && <Badge variant="outline">Premium</Badge>}
+          {smartBadges.includes("GREAT_ALTERNATIVE") && <Badge>Great alternative</Badge>}
+          {suggestion.promotion && <Badge>Multi-year offer</Badge>}
+        </div>
+        {suggestion.promotion && <p className="mt-1 text-xs text-muted-foreground">{suggestion.promotion.requiredYears}-year offer · Additional years {formatDomainAmount(suggestion.promotion.additionalYearPrice, suggestion.promotion.currency)} each</p>}
+        {suggestion.renewalPricing?.customerAmount != null && <p className="mt-1 text-xs text-muted-foreground">Renews at {formatDomainAmount(suggestion.renewalPricing.customerAmount, suggestion.renewalPricing.customerCurrency)} / year</p>}
+      </div>
+      <div className="flex shrink-0 flex-col items-stretch gap-2 sm:min-w-52 sm:items-end">
+        {(available || preview) && (suggestion.discountedPrice != null || suggestion.pricing.customerAmount != null) && <div className="text-left sm:text-right">
+          {suggestion.promotion && suggestion.originalPrice != null && <span className="mr-2 text-sm text-muted-foreground line-through">{formatDomainAmount(suggestion.originalPrice, suggestion.promotion.currency)}</span>}
+          <span className="font-semibold">{formatDomainAmount(suggestion.discountedPrice ?? suggestion.pricing.customerAmount, suggestion.promotion?.currency || suggestion.pricing.customerCurrency)}</span>
+          <p className="text-xs text-muted-foreground">{suggestion.promotion ? "for the first year" : `/ ${suggestion.period} ${suggestion.period === 1 ? "year" : "years"}`}</p>
+        </div>}
+        {available ? <Button onClick={() => onSelect(suggestion)} disabled={pending || (selected && checkoutReady)}>{pending && selected ? <LoaderCircle className="animate-spin" /> : null}{selected && checkoutReady ? "Checkout ready" : "Continue to checkout"}<ArrowRight /></Button>
+          : preview ? <Button variant="outline" disabled><LoaderCircle className="animate-spin" />Checking...</Button> : null}
+      </div>
+    </div>;
+  })}</div>;
 }
 
 export function SearchAndBuy({ token }: { token: string }) {
@@ -218,37 +306,105 @@ export function SearchAndBuy({ token }: { token: string }) {
   const [contact, setContact] = useState(emptyContact); const [searching, setSearching] = useState(false); const [retryVersion, setRetryVersion] = useState(0); const [searchError, setSearchError] = useState(""); const [pending, setPending] = useState(false); const [error, setError] = useState(""); const [order, setOrder] = useState<DomainOrder | null>(null);
   const [purchaseKey, setPurchaseKey] = useState("");
   const [purchaseToast, setPurchaseToast] = useState<{ title: string; message: string } | null>(null);
-  const suggestionNames = useMemo(() => buildDomainSuggestions(query), [query]);
+  const latestSearchId = useRef(0);
+  const searchQuery = query.trim();
   useEffect(() => {
-    const domainNames = suggestionNames;
-    setResult(null); setQuote(null); setOrder(null); setError(""); setSearchError("");
-    if (!domainNames.length) { setSuggestions([]); setSearching(false); return; }
-    const now = Date.now();
-    const cached = domainNames.map((domainName) => liveSearchCache.get(domainName)).filter((item) => item && item.expiresAt > now).map((item) => item!.result);
-    const cachedNames = new Set(cached.map((item) => item.domainName));
-    const missing = domainNames.filter((domainName) => !cachedNames.has(domainName));
-    setSuggestions(cached);
-    if (!missing.length) { setSearching(false); return; }
+    const currentQuery = query.trim();
+    const searchId = ++latestSearchId.current;
+    setResult(null); setQuote(null); setOrder(null); setError(""); setSearchError(""); setSuggestions([]);
+    if (currentQuery.length < 2) { setSuggestions([]); setSearching(false); return; }
     let active = true;
-    const timer = window.setTimeout(() => {
+    const controller = new AbortController();
+    const isCurrent = () => active && latestSearchId.current === searchId;
+    const checkInBatches = async (domainNames: string[], batchSize: number) => {
+      const uniqueNames = [...new Set(domainNames.filter(Boolean))];
+      for (let index = 0; index < uniqueNames.length; index += batchSize) {
+        if (!isCurrent()) return;
+        try {
+          const response = await domainApi<StagedSearchResponse>(token, "/v1/domain/search/smart/retry", {
+            method: "POST",
+            signal: controller.signal,
+            body: JSON.stringify({ domainNames: uniqueNames.slice(index, index + batchSize) }),
+          });
+          if (isCurrent()) setSuggestions((current) => mergeSearchResults(current, response.results || []));
+        } catch (batchCause) {
+          if (batchCause instanceof Error && batchCause.name === "AbortError") return;
+          // One slow provider batch must not block or clear the other preview cards.
+        }
+      }
+    };
+    const timer = window.setTimeout(async () => {
       setSearching(true);
-      domainApi<{ results: SearchResult[] }>(token, "/v1/domain/search/bulk", { method: "POST", body: JSON.stringify({ domainNames: missing }) })
-        .then((data) => { if (!active) return; const expiresAt = Date.now() + 60_000; (data.results || []).forEach((item) => liveSearchCache.set(item.domainName, { result: item, expiresAt })); setSuggestions(domainNames.map((domainName) => liveSearchCache.get(domainName)?.result).filter((item): item is SearchResult => Boolean(item))); })
-        .catch(() => { if (active) setSearchError("We couldn't check availability right now. Please try again in a moment."); })
-        .finally(() => { if (active) setSearching(false); });
-    }, 250);
-    return () => { active = false; window.clearTimeout(timer); };
-  }, [retryVersion, suggestionNames, token]);
-  const searchDomain = (event: FormEvent) => { event.preventDefault(); if (!searching && suggestionNames.length) setRetryVersion((value) => value + 1); };
-  const createQuote = async (selected: SearchResult) => { setResult(selected); setQuote(null); setOrder(null); setPurchaseKey(""); setPending(true); setError(""); try { const nextQuote = await domainApi<Quote>(token, "/v1/domain/quotes/registration", { method: "POST", body: JSON.stringify({ domainName: selected.domainName, period: selected.promotion?.requiredYears || selected.period, campaignId: selected.promotion?.campaignId }) }); setQuote(nextQuote); setPurchaseKey(createIdempotencyKey("domain-register")); window.requestAnimationFrame(() => document.getElementById("domain-checkout-form")?.scrollIntoView({ behavior: "smooth", block: "start" })); } catch (cause) { setError(cause instanceof Error ? cause.message : "Unable to create quote."); } finally { setPending(false); } };
+      try {
+        const preview = await domainApi<{ results: SearchResult[] }>(token, "/v1/domain/search/smart/preview", { method: "POST", signal: controller.signal, body: JSON.stringify({ query: currentQuery }) });
+        if (!isCurrent()) return;
+        setSuggestions(preview.results || []);
+        const visibleDomains = (preview.results || []).slice(0, 6).map((item) => item.domainName);
+        const backgroundDomains = (preview.results || []).slice(6).map((item) => item.domainName);
+        await checkInBatches(visibleDomains, 2);
+        if (!isCurrent()) return;
+        setSearching(false);
+        void checkInBatches(backgroundDomains, 6);
+      } catch (cause) {
+        if (cause instanceof Error && cause.name === "AbortError") return;
+        if (isCurrent()) setSearchError(cause instanceof Error ? cause.message : "We couldn't check availability right now. Please try again in a moment.");
+      } finally {
+        if (isCurrent()) setSearching(false);
+      }
+    }, 100);
+    return () => { active = false; controller.abort(); window.clearTimeout(timer); };
+  }, [query, retryVersion, token]);
+  const searchDomain = (event: FormEvent) => { event.preventDefault(); if (!searching && searchQuery.length >= 2) setRetryVersion((value) => value + 1); };
+  const createQuote = async (selected: SearchResult) => {
+    setResult(selected); setQuote(null); setOrder(null); setPurchaseKey(""); setPending(true); setError("");
+    try {
+      const quoteRequest = (usePromotion: boolean) => domainApi<Quote>(token, "/v1/domain/quotes/registration", {
+        method: "POST",
+        body: JSON.stringify({
+          domainName: selected.domainName,
+          period: usePromotion ? selected.promotion?.requiredYears || selected.period : selected.period,
+          campaignId: usePromotion ? selected.promotion?.campaignId : undefined,
+        }),
+      });
+      let nextQuote: Quote;
+      try {
+        nextQuote = await quoteRequest(Boolean(selected.promotion));
+      } catch (cause) {
+        const promotionUnavailable = cause instanceof DomainApiError
+          && ["DOMAIN_CAMPAIGN_MARGIN_GUARD", "DOMAIN_CAMPAIGN_UNAVAILABLE"].includes(cause.code);
+        if (!selected.promotion || !promotionUnavailable) throw cause;
+        nextQuote = await quoteRequest(false);
+        const withoutPromotion: SearchResult = {
+          ...selected,
+          promotion: null,
+          originalPrice: null,
+          discountedPrice: selected.pricing.customerAmount,
+        };
+        setResult(withoutPromotion);
+        setSuggestions((current) => current.map((item) => item.domainName === selected.domainName ? withoutPromotion : item));
+      }
+      setQuote(nextQuote);
+      setPurchaseKey(createIdempotencyKey("domain-register"));
+      window.requestAnimationFrame(() => document.getElementById("domain-checkout-form")?.scrollIntoView({ behavior: "smooth", block: "start" }));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Unable to create quote.");
+    } finally {
+      setPending(false);
+    }
+  };
   const purchase = async (event: FormEvent) => { event.preventDefault(); if (!quote || !purchaseKey) return; setError(""); setPurchaseToast(null); setPending(true); try { const currentWallet = await domainApi<Wallet>(token, "/v1/domain/wallet"); if (currentWallet.availableCredits < quote.pricing.customerAmount) { const shortfall = quote.pricing.customerAmount - currentWallet.availableCredits; setPurchaseToast({ title: "Insufficient credits", message: `Please add ${formatDomainAmount(shortfall, quote.pricing.customerCurrency)} more credits to purchase this domain.` }); return; } const contacts = ["Registrant", "Admin", "Tech", "Billing"].map((contactType) => ({ ...contact, contactType })); const value = await domainApi<DomainOrder>(token, "/v1/domain/purchases/registration", { method: "POST", headers: { "Idempotency-Key": purchaseKey }, body: JSON.stringify({ quoteId: quote.quoteId, contacts, tldAttributes: {}, useTrusteeContact: false }) }); setOrder(value); } catch (cause) { const message = cause instanceof Error ? cause.message : "Registration failed."; const code = cause instanceof DomainApiError ? cause.code : ""; setPurchaseToast({ title: code === "INSUFFICIENT_DOMAIN_CREDITS" ? "Insufficient credits" : code === "DOMAIN_NAMESERVERS_NOT_CONFIGURED" ? "Domain purchase unavailable" : "Purchase could not be completed", message }); } finally { setPending(false); } };
+  const visibleSuggestions = suggestions;
+  const showSearchLoading = searchQuery.length >= 2 && !searchError && visibleSuggestions.length === 0;
   return <div className="space-y-6"><PageHeading title="Search & Buy Domain" description="Type a name to see live availability and prices." />
     {purchaseToast && <div role="alert" aria-live="assertive" className="fixed top-5 right-5 z-50 flex w-[calc(100%-2.5rem)] max-w-md items-start gap-3 rounded-xl border border-amber-300 bg-amber-50 p-4 text-amber-950 shadow-lg"><TriangleAlert className="mt-0.5 size-5 shrink-0" /><div className="min-w-0 flex-1"><p className="font-medium">{purchaseToast.title}</p><p className="mt-1 text-sm">{purchaseToast.message}</p></div><button type="button" onClick={() => setPurchaseToast(null)} className="rounded-md px-2 py-1 text-sm font-medium hover:bg-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-600">Dismiss</button></div>}
-    <Card className="border-primary/40 bg-primary/10"><CardContent><form className="flex flex-col gap-2 sm:flex-row" onSubmit={searchDomain}><div className="relative flex-1"><Search className="absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" /><Input value={query} onChange={(event) => setQuery(event.target.value)} required autoComplete="off" placeholder="Type your domain name" className="h-11 pl-9" aria-label="Domain name" /></div><Button className="h-11 bg-teal-700 text-white hover:bg-teal-800 disabled:bg-teal-700 disabled:text-white disabled:opacity-70 sm:px-6" disabled={searching || suggestionNames.length === 0}>{searching ? <LoaderCircle className="animate-spin" /> : <Search />}Search Domains</Button></form></CardContent></Card>
-    {suggestionNames.length === 0 && <Card className="overflow-hidden border-0 bg-gradient-to-br from-emerald-950 via-teal-900 to-slate-950 text-white shadow-lg"><CardContent className="p-0"><div className="grid min-h-80 lg:grid-cols-[1.3fr_0.7fr]"><div className="flex flex-col justify-center p-7 sm:p-10 lg:p-12"><Badge className="mb-5 w-fit border-white/20 bg-white/10 text-white hover:bg-white/10">SellersLogin Domains</Badge><h3 className="max-w-2xl text-3xl font-semibold tracking-tight sm:text-4xl">Your next big idea deserves the right domain.</h3><p className="mt-4 max-w-xl text-sm leading-6 text-white/75 sm:text-base">Search your business name and compare available domain options. Any eligible first-year or multi-year discount is applied automatically.</p><div className="mt-7 flex flex-wrap gap-x-6 gap-y-3 text-sm text-white/85"><span className="flex items-center gap-2"><ShieldCheck className="size-4 text-emerald-300" />Clear total before purchase</span><span className="flex items-center gap-2"><WalletCards className="size-4 text-emerald-300" />Pay with wallet credits</span><span className="flex items-center gap-2"><Globe2 className="size-4 text-emerald-300" />DNS tools included</span></div></div><div className="m-5 flex flex-col justify-center rounded-2xl border border-white/15 bg-white/10 p-6 backdrop-blur-sm lg:m-7"><p className="text-sm font-medium text-emerald-200">Popular domain endings</p><p className="mt-2 text-lg font-semibold">Search a name with any popular ending.</p><div className="mt-5 grid grid-cols-2 gap-3">{["com", "in", "co.in", "net"].map((extension) => <div key={extension} className="rounded-xl border border-white/15 bg-white/10 px-4 py-3 font-semibold"><span className="text-emerald-200">.</span>{extension}</div>)}</div><p className="mt-5 text-xs leading-5 text-white/65">Offer duration, later-year price and the full amount payable are shown before checkout.</p></div></div></CardContent></Card>}
+    <Card className="border-primary/40 bg-primary/10"><CardContent><form className="flex flex-col gap-2 sm:flex-row" onSubmit={searchDomain}><div className="relative flex-1"><Search className="absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" /><Input value={query} onChange={(event) => setQuery(event.target.value)} required autoComplete="off" placeholder="Type your domain name" className="h-11 pl-9" aria-label="Domain name" /></div><Button className="h-11 bg-teal-700 text-white hover:bg-teal-800 disabled:bg-teal-700 disabled:text-white disabled:opacity-70 sm:px-6" disabled={searching || searchQuery.length < 2}>{searching ? <LoaderCircle className="animate-spin" /> : <Search />}Search Domains</Button></form></CardContent></Card>
+    {searchQuery.length < 2 && <Card className="overflow-hidden border-0 bg-gradient-to-br from-emerald-950 via-teal-900 to-slate-950 text-white shadow-lg"><CardContent className="p-0"><div className="grid min-h-80 lg:grid-cols-[1.3fr_0.7fr]"><div className="flex flex-col justify-center p-7 sm:p-10 lg:p-12"><Badge className="mb-5 w-fit border-white/20 bg-white/10 text-white hover:bg-white/10">SellersLogin Domains</Badge><h3 className="max-w-2xl text-3xl font-semibold tracking-tight sm:text-4xl">Your next big idea deserves the right domain.</h3><p className="mt-4 max-w-xl text-sm leading-6 text-white/75 sm:text-base">Search your business name and compare available domain options. Any eligible first-year or multi-year discount is applied automatically.</p><div className="mt-7 flex flex-wrap gap-x-6 gap-y-3 text-sm text-white/85"><span className="flex items-center gap-2"><ShieldCheck className="size-4 text-emerald-300" />Clear total before purchase</span><span className="flex items-center gap-2"><WalletCards className="size-4 text-emerald-300" />Pay with wallet credits</span><span className="flex items-center gap-2"><Globe2 className="size-4 text-emerald-300" />DNS tools included</span></div></div><div className="m-5 flex flex-col justify-center rounded-2xl border border-white/15 bg-white/10 p-6 backdrop-blur-sm lg:m-7"><p className="text-sm font-medium text-emerald-200">Popular domain endings</p><p className="mt-2 text-lg font-semibold">Search a name with any popular ending.</p><div className="mt-5 grid grid-cols-2 gap-3">{["com", "in", "co.in", "net"].map((extension) => <div key={extension} className="rounded-xl border border-white/15 bg-white/10 px-4 py-3 font-semibold"><span className="text-emerald-200">.</span>{extension}</div>)}</div><p className="mt-5 text-xs leading-5 text-white/65">Offer duration, later-year price and the full amount payable are shown before checkout.</p></div></div></CardContent></Card>}
     {searchError && <ErrorState message={searchError} retry={() => { setSearchError(""); setRetryVersion((value) => value + 1); }} />}
     {error && <ErrorState message={error} />}
-    {suggestionNames.length > 0 && (!searchError || suggestions.length > 0) && <Card><CardHeader><CardTitle>Domain suggestions</CardTitle><CardDescription>Live availability and current SellersLogin price.</CardDescription></CardHeader><CardContent className="p-0"><div className="divide-y">{(searchError ? suggestions.map((item) => item.domainName) : suggestionNames).map((domainName) => { const suggestion = suggestions.find((item) => item.domainName === domainName); if (!suggestion) return <div key={domainName} className="flex items-center justify-between gap-4 p-4"><p className="font-medium">{domainName}</p><Badge variant="outline"><LoaderCircle className="animate-spin" />Checking</Badge></div>; const available = suggestion.status === "AVAILABLE"; const selected = result?.domainName === suggestion.domainName; return <div key={suggestion.domainName} className="flex flex-col gap-4 p-4 sm:flex-row sm:items-center sm:justify-between"><div className="min-w-0"><div className="flex flex-wrap items-center gap-2"><p className="font-medium">{suggestion.domainName}</p><Badge variant={available ? "secondary" : "outline"}>{available ? "Available" : "Not available"}</Badge>{suggestion.isPremium && <Badge variant="outline">Premium</Badge>}{suggestion.promotion && <Badge>Multi-year offer</Badge>}</div>{suggestion.promotion ? <><p className="mt-1 font-medium">{formatDomainAmount(suggestion.promotion.firstYearPrice, suggestion.promotion.currency)} for the first year</p><p className="text-xs text-muted-foreground">{suggestion.promotion.requiredYears}-year purchase required. Additional years {formatDomainAmount(suggestion.promotion.additionalYearPrice, suggestion.promotion.currency)} each · Bundle {formatDomainAmount(suggestion.promotion.bundleSubtotal, suggestion.promotion.currency)}</p></> : <p className="mt-1 text-sm text-muted-foreground">{available ? `${formatDomainAmount(suggestion.pricing.customerAmount, suggestion.pricing.customerCurrency)} / ${suggestion.period} year` : "Try another extension from the suggestions below."}</p>}</div>{available && <Button onClick={() => createQuote(suggestion)} disabled={pending || (selected && Boolean(quote))}>{pending && selected ? <LoaderCircle className="animate-spin" /> : null}{selected && quote ? "Checkout ready" : "Continue to checkout"}<ArrowRight /></Button>}</div>; })}</div></CardContent></Card>}
+    {searchQuery.length >= 2 && (!searchError || suggestions.length > 0) && <Card>
+      <CardHeader><CardTitle>Choose your domain</CardTitle><CardDescription>{showSearchLoading ? "Preparing domain suggestions..." : searching ? "Verifying live availability and prices..." : "Domain's by SellersLogin"}</CardDescription></CardHeader>
+      <CardContent className="p-0">{showSearchLoading ? <DomainSearchLoading /> : <DomainSuggestionRows suggestions={visibleSuggestions} selectedDomain={result?.domainName} checkoutReady={Boolean(quote)} pending={pending} onSelect={createQuote} />}</CardContent>
+    </Card>}
     {quote && !order && <Card id="domain-checkout-form"><CardHeader><CardTitle>Registrant details</CardTitle><CardDescription>Complete the details for {quote.domainName}. SellersLogin configures DNS automatically, and nameservers can be changed after purchase.</CardDescription></CardHeader><CardContent><form className="grid gap-4 sm:grid-cols-2" onSubmit={purchase}>{Object.entries(contact).map(([key, value]) => <div key={key} className="space-y-2"><Label htmlFor={key}>{key.replace(/([A-Z])/g, " $1").replace(/^./, (letter) => letter.toUpperCase())}</Label><Input id={key} type={key === "eMail" ? "email" : "text"} value={value} required={key !== "companyName"} onChange={(event) => setContact((current) => ({ ...current, [key]: event.target.value }))} /></div>)}<div className="rounded-md border bg-muted/30 p-4 sm:col-span-2">{quote.pricing.campaign && <div className="mb-3 space-y-1 text-sm"><div className="flex justify-between"><span>First year promotional price</span><span>{formatDomainAmount(quote.pricing.campaign.firstYearPrice, quote.pricing.customerCurrency)}</span></div><div className="flex justify-between"><span>Additional {quote.pricing.campaign.requiredYears - 1} years</span><span>{formatDomainAmount(quote.pricing.campaign.additionalYearPrice * (quote.pricing.campaign.requiredYears - 1), quote.pricing.customerCurrency)}</span></div></div>}<div className="flex items-center justify-between border-t pt-3"><div><p className="font-medium">Total: {formatDomainAmount(quote.pricing.customerAmount, quote.pricing.customerCurrency)}</p><p className="text-xs text-muted-foreground">{quote.period}-year term · Paid from SellersLogin credits · Quote expires {formatDomainDate(quote.expiresAt)}</p></div><Button disabled={pending}>{pending ? <LoaderCircle className="animate-spin" /> : <CreditCard />}Confirm purchase</Button></div></div></form></CardContent></Card>}
     {order && <Card className="border-primary"><CardContent className="flex items-start gap-3 py-6"><CheckCircle2 className="size-5 text-primary" /><div><p className="font-medium">Order {order.status.replaceAll("_", " ")}</p><p className="text-sm text-muted-foreground">Order ID: {order.orderId}</p></div></CardContent></Card>}
   </div>;
@@ -325,5 +481,5 @@ export function Contacts({ token }: { token: string }) {
 
 export function OrdersAndBilling({ token }: { token: string }) {
   const orders = useResource<PageResult<DomainOrder>>(token, "/v1/domain/orders?page=1&limit=100"); const wallet = useResource<Wallet>(token, "/v1/domain/wallet");
-  return <div className="space-y-6"><PageHeading title="Orders & Billing" description="Domain transactions and SellersLogin credit usage." action={<Button asChild variant="outline"><Link href="/search">New purchase</Link></Button>} /><section className="grid gap-4 sm:grid-cols-3">{[{ label: "Available", value: wallet.data?.availableCredits }, { label: "Reserved", value: wallet.data?.reservedCredits }, { label: "Used", value: wallet.data?.usedCredits }].map((item) => <Card key={item.label}><CardHeader><CardDescription>{item.label} credits</CardDescription><CardTitle className="text-2xl">{wallet.loading || item.value == null ? "—" : `${item.value.toLocaleString("en-IN")} ${wallet.data?.currency}`}</CardTitle></CardHeader></Card>)}</section>{(orders.error || wallet.error) && <ErrorState message={orders.error || wallet.error} retry={() => { orders.reload(); wallet.reload(); }} />}<Card><CardContent className="pt-6">{orders.loading ? <LoadingState /> : orders.data?.items.length ? <div className="overflow-x-auto"><table className="w-full min-w-3xl text-sm"><thead><tr className="border-b text-left"><th className="pb-3">Domain</th><th className="pb-3">Operation</th><th className="pb-3">Amount</th><th className="pb-3">Date</th><th className="pb-3 text-right">Status</th></tr></thead><tbody>{orders.data.items.map((order) => <tr key={order.orderId} className="border-b last:border-0"><td className="py-4 font-medium">{order.domainName}</td><td className="py-4">{order.operation}</td><td className="py-4">{formatDomainAmount(order.amount, order.currency)}</td><td className="py-4 text-muted-foreground">{formatDomainDate(order.createdAt)}</td><td className="py-4 text-right"><Badge variant={order.status === "COMPLETED" ? "secondary" : "outline"}>{order.status.replaceAll("_", " ")}</Badge></td></tr>)}</tbody></table></div> : <EmptyState title="No billing activity" description="Completed and pending domain orders will appear here." />}</CardContent></Card></div>;
+  return <div className="space-y-6"><PageHeading title="Orders & Billing" description="Domain transactions and SellersLogin credit usage." action={<Button asChild variant="outline"><Link href="/search">New purchase</Link></Button>} /><section className="grid gap-4 sm:grid-cols-2">{[{ label: "Available", value: wallet.data?.availableCredits }, { label: "Used", value: wallet.data?.usedCredits }].map((item) => <Card key={item.label}><CardHeader><CardDescription>{item.label} credits</CardDescription><CardTitle className="text-2xl">{wallet.loading || item.value == null ? "—" : `${item.value.toLocaleString("en-IN")} ${wallet.data?.currency}`}</CardTitle></CardHeader></Card>)}</section>{(orders.error || wallet.error) && <ErrorState message={orders.error || wallet.error} retry={() => { orders.reload(); wallet.reload(); }} />}<Card><CardContent className="pt-6">{orders.loading ? <LoadingState /> : orders.data?.items.length ? <div className="overflow-x-auto"><table className="w-full min-w-3xl text-sm"><thead><tr className="border-b text-left"><th className="pb-3">Domain</th><th className="pb-3">Operation</th><th className="pb-3">Amount</th><th className="pb-3">Date</th><th className="pb-3 text-right">Status</th></tr></thead><tbody>{orders.data.items.map((order) => <tr key={order.orderId} className="border-b last:border-0"><td className="py-4 font-medium">{order.domainName}</td><td className="py-4">{order.operation}</td><td className="py-4">{formatDomainAmount(order.amount, order.currency)}</td><td className="py-4 text-muted-foreground">{formatDomainDate(order.createdAt)}</td><td className="py-4 text-right"><Badge variant={order.status === "COMPLETED" ? "secondary" : "outline"}>{order.status.replaceAll("_", " ")}</Badge></td></tr>)}</tbody></table></div> : <EmptyState title="No billing activity" description="Completed and pending domain orders will appear here." />}</CardContent></Card></div>;
 }
