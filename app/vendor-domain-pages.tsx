@@ -22,7 +22,8 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { createIdempotencyKey, domainApi, DomainApiError, formatDomainAmount, formatDomainDate } from "@/lib/domain-api";
+import { createIdempotencyKey, domainApi, domainNdjsonStream, DomainApiError, formatDomainAmount, formatDomainDate } from "@/lib/domain-api";
+import { boundedSearchSignal, domainSearchRank, isCurrentDomainSearch, isSuggestionCheckFailed, isVerifiedAvailable, shouldStartDomainSearch } from "@/lib/domain-search-state";
 
 type PageResult<T> = { items: T[]; total: number; page: number; limit: number; pages: number };
 type DomainAsset = {
@@ -63,9 +64,17 @@ type SearchResult = {
   originalPrice?: number | null;
   discountedPrice?: number | null;
   renewalPricing?: { customerAmount: number | null; customerCurrency: string | null } | null;
+  renewalPricingStatus?: "NOT_APPLICABLE" | "NOT_LOADED" | "LOADING" | "READY" | "UNKNOWN";
   promotion?: { campaignId: string; name: string; firstYearPrice: number; additionalYearPrice: number; requiredYears: number; bundleSubtotal: number; currency: string } | null;
+  metrics?: { upstreamCallCount?: number; cacheHit?: boolean; totalMs?: number };
 };
-type StagedSearchResponse = { results: SearchResult[]; failedDomains?: string[]; partial?: boolean };
+type PrimarySearchResponse = { exactDomain: string; result: SearchResult };
+type SmartStreamEvent =
+  | { type: "meta"; candidates: string[]; offset: number; total: number; hasMore: boolean }
+  | { type: "result"; result: SearchResult; timing: { lookupMs: number; timedOut: boolean; completedCount: number; elapsedMs: number } }
+  | { type: "done"; nextOffset: number; hasMore: boolean; upstreamCallCount: number; errorCount: number; totalMs: number }
+  | { type: "error"; message: string };
+type RenewalPriceResponse = { domainName: string; renewalPricing: SearchResult["renewalPricing"]; renewalPricingStatus: SearchResult["renewalPricingStatus"] };
 type Quote = {
   quoteId: string;
   domainName: string;
@@ -236,6 +245,7 @@ function mergeSearchResults(current: SearchResult[], incoming: SearchResult[]): 
   const merged = current.map((item) => {
     const update = updates.get(item.domainName);
     if (!update) return item;
+    if (item.liveVerified === true && update.status === "PREVIEW") return item;
     if (update.liveVerified !== true && item.estimated) {
       return { ...item, status: "UNKNOWN", reason: update.reason, liveVerified: false, checkFailed: true };
     }
@@ -244,7 +254,11 @@ function mergeSearchResults(current: SearchResult[], incoming: SearchResult[]): 
       ...(update.badges || []),
       ...(update.isPremium ? ["PREMIUM" as const] : []),
     ];
-    return { ...update, badges: [...new Set([...persistentBadges, ...liveBadges])], checkFailed: false };
+    return {
+      ...update,
+      badges: [...new Set([...persistentBadges, ...liveBadges])],
+      checkFailed: isSuggestionCheckFailed(update),
+    };
   });
   for (const item of incoming) if (!merged.some((value) => value.domainName === item.domainName)) merged.push(item);
   const normalized: SearchResult[] = merged.map((item) => ({ ...item, badges: (item.badges || []).filter((badge) => badge !== "GREAT_ALTERNATIVE") }));
@@ -257,7 +271,7 @@ function mergeSearchResults(current: SearchResult[], incoming: SearchResult[]): 
     : item);
 }
 
-function DomainSearchLoading() {
+export function DomainSearchLoading() {
   return <div role="status" aria-live="polite" aria-label="Checking domain availability" className="divide-y">
     {[0, 1, 2, 3, 4].map((row) => <div key={row} className="flex items-center justify-between gap-4 p-4">
       <div className="flex flex-1 items-center gap-3">
@@ -270,24 +284,18 @@ function DomainSearchLoading() {
   </div>;
 }
 
-function DomainSuggestionRows({ suggestions, selectedDomain, checkoutReady, pending, onSelect }: {
+export function DomainSuggestionRows({ suggestions, selectedDomain, checkoutReady, pending, onSelect, onRetry }: {
   suggestions: SearchResult[];
   selectedDomain?: string;
   checkoutReady: boolean;
   pending: boolean;
   onSelect: (suggestion: SearchResult) => void;
+  onRetry?: () => void;
 }) {
   const displaySuggestions = suggestions
-    .filter((suggestion) => !suggestion.checkFailed && !["UNKNOWN", "NONE", "ERROR"].includes(suggestion.status))
     .map((suggestion, index) => ({ suggestion, index }))
     .sort((left, right) => {
-      const rank = (item: SearchResult) => {
-        if (item.status === "AVAILABLE" && item.liveVerified === true) return 0;
-        if (item.liveVerified === true) return 1;
-        if (item.status === "PREVIEW") return 2;
-        return 3;
-      };
-      return rank(left.suggestion) - rank(right.suggestion) || left.index - right.index;
+      return domainSearchRank(left.suggestion) - domainSearchRank(right.suggestion) || left.index - right.index;
     })
     .map(({ suggestion }) => suggestion);
   return <div className="divide-y">{displaySuggestions.map((suggestion) => {
@@ -306,6 +314,8 @@ function DomainSuggestionRows({ suggestions, selectedDomain, checkoutReady, pend
         </div>
         {suggestion.promotion && <p className="mt-1 text-xs text-muted-foreground">{suggestion.promotion.requiredYears}-year offer · Additional years {formatDomainAmount(suggestion.promotion.additionalYearPrice, suggestion.promotion.currency)} each</p>}
         {suggestion.renewalPricing?.customerAmount != null && <p className="mt-1 text-xs text-muted-foreground">Renews at {formatDomainAmount(suggestion.renewalPricing.customerAmount, suggestion.renewalPricing.customerCurrency)} / year</p>}
+        {suggestion.isPremium && suggestion.renewalPricingStatus === "LOADING" && <p className="mt-1 text-xs text-muted-foreground">Checking premium renewal price separately...</p>}
+        {suggestion.isPremium && ["NOT_LOADED", "UNKNOWN"].includes(suggestion.renewalPricingStatus || "") && <p className="mt-1 text-xs text-muted-foreground">Premium renewal price is not available yet.</p>}
       </div>
       <div className="flex shrink-0 flex-col items-stretch gap-2 sm:min-w-52 sm:items-end">
         {(available || preview || suggestion.checkFailed) && (suggestion.discountedPrice != null || suggestion.pricing.customerAmount != null) && <div className="text-left sm:text-right">
@@ -314,98 +324,288 @@ function DomainSuggestionRows({ suggestions, selectedDomain, checkoutReady, pend
           <p className="text-xs text-muted-foreground">{suggestion.promotion ? "for the first year" : `/ ${suggestion.period} ${suggestion.period === 1 ? "year" : "years"}`}</p>
         </div>}
         {available ? <Button onClick={() => onSelect(suggestion)} disabled={pending || (selected && checkoutReady)}>{pending && selected ? <LoaderCircle className="animate-spin" /> : null}{selected && checkoutReady ? "Checkout ready" : "Continue to checkout"}<ArrowRight /></Button>
-          : preview ? <Button variant="outline" disabled><LoaderCircle className="animate-spin" />Checking...</Button> : null}
+          : preview ? <Button variant="outline" disabled><LoaderCircle className="animate-spin" />Checking...</Button>
+            : suggestion.checkFailed || ["UNKNOWN", "NONE", "ERROR"].includes(suggestion.status) ? <Button variant="outline" onClick={onRetry}><RefreshCcw />Unable to check — Retry</Button> : null}
       </div>
+    </div>;
+  })}</div>;
+}
+
+function DomainPrice({ suggestion }: { suggestion: SearchResult }) {
+  const amount = suggestion.discountedPrice ?? suggestion.pricing.customerAmount;
+  if (suggestion.liveVerified !== true || suggestion.status !== "AVAILABLE" || amount == null) return null;
+  return <div>
+    {suggestion.promotion && suggestion.originalPrice != null && <span className="mr-2 text-sm text-muted-foreground line-through">{formatDomainAmount(suggestion.originalPrice, suggestion.promotion.currency)}</span>}
+    <span className="text-xl font-semibold tracking-tight">{formatDomainAmount(amount, suggestion.promotion?.currency || suggestion.pricing.customerCurrency)}</span>
+    <p className="mt-0.5 text-xs text-muted-foreground">{suggestion.promotion ? "First year offer" : `${suggestion.period}-year registration`}</p>
+  </div>;
+}
+
+function FeaturedDomainCard({ title, suggestion, loading, selectedDomain, checkoutReady, pending, onSelect, onRetry }: {
+  title: string;
+  suggestion?: SearchResult;
+  loading?: boolean;
+  selectedDomain?: string;
+  checkoutReady: boolean;
+  pending: boolean;
+  onSelect: (suggestion: SearchResult) => void;
+  onRetry: (suggestion: SearchResult) => void;
+}) {
+  if (!suggestion && loading) return <Card className="min-h-64 overflow-hidden border-teal-200/80 shadow-sm">
+    <CardContent className="space-y-6 p-6">
+      <div className="h-5 w-40 animate-pulse rounded bg-muted" />
+      <div className="h-9 w-56 animate-pulse rounded bg-muted" />
+      <div className="mt-12 h-8 w-32 animate-pulse rounded bg-muted" />
+      <div className="h-10 w-full animate-pulse rounded-lg bg-muted" />
+    </CardContent>
+  </Card>;
+  if (!suggestion) return <Card className="min-h-64 border-dashed"><CardContent className="flex h-full min-h-64 flex-col justify-center p-6"><Badge variant="outline" className="w-fit">{title}</Badge><p className="mt-4 text-lg font-semibold">No verified alternative yet</p><p className="mt-2 text-sm text-muted-foreground">Load more suggestions to continue checking live availability.</p></CardContent></Card>;
+
+  const available = suggestion.status === "AVAILABLE" && suggestion.liveVerified === true;
+  const checking = suggestion.status === "PREVIEW";
+  const failed = suggestion.checkFailed || ["UNKNOWN", "NONE", "ERROR"].includes(suggestion.status);
+  const selected = selectedDomain === suggestion.domainName;
+  return <Card className={`min-h-64 overflow-hidden shadow-sm ${available ? "border-teal-300" : "border-border"}`}>
+    <CardContent className="flex min-h-64 flex-col p-6">
+      <div className="flex items-center justify-between gap-3"><Badge className={title === "Recommended alternative" ? "bg-amber-100 text-amber-950 hover:bg-amber-100" : ""} variant={title === "Recommended alternative" ? "default" : "outline"}>{title}</Badge>{suggestion.isPremium && <Badge variant="outline">Premium</Badge>}</div>
+      <div className="mt-5"><p className="break-all text-2xl font-semibold tracking-tight sm:text-3xl">{suggestion.domainName}</p><p className={`mt-2 text-sm font-medium ${available ? "text-teal-700" : "text-muted-foreground"}`}>{availabilityLabel(suggestion.status)}</p></div>
+      <div className="mt-auto pt-8">
+        <DomainPrice suggestion={suggestion} />
+        <div className="mt-4">
+          {available ? <Button className="w-full bg-teal-700 text-white hover:bg-teal-800" onClick={() => onSelect(suggestion)} disabled={pending || (selected && checkoutReady)}>{pending && selected ? <LoaderCircle className="animate-spin" /> : null}{selected && checkoutReady ? "Checkout ready" : "Continue to checkout"}<ArrowRight /></Button>
+            : checking ? <Button className="w-full" variant="outline" disabled><LoaderCircle className="animate-spin" />Checking live availability</Button>
+              : failed ? <Button className="w-full" variant="outline" onClick={() => onRetry(suggestion)}><RefreshCcw />Unable to check — Retry</Button>
+                : <p className="rounded-lg bg-muted px-4 py-3 text-sm text-muted-foreground">This domain is not available for registration.</p>}
+        </div>
+      </div>
+    </CardContent>
+  </Card>;
+}
+
+function CompactSuggestionRows({ suggestions, selectedDomain, checkoutReady, pending, onSelect, onRetry }: {
+  suggestions: SearchResult[];
+  selectedDomain?: string;
+  checkoutReady: boolean;
+  pending: boolean;
+  onSelect: (suggestion: SearchResult) => void;
+  onRetry: (suggestion: SearchResult) => void;
+}) {
+  return <div className="divide-y">{suggestions.map((suggestion) => {
+    const available = suggestion.status === "AVAILABLE" && suggestion.liveVerified === true;
+    const checking = suggestion.status === "PREVIEW";
+    const failed = suggestion.checkFailed || ["UNKNOWN", "NONE", "ERROR"].includes(suggestion.status);
+    const selected = selectedDomain === suggestion.domainName;
+    return <div key={suggestion.domainName} className="grid gap-3 px-4 py-4 sm:grid-cols-[minmax(0,1fr)_auto_auto] sm:items-center sm:px-6">
+      <div className="min-w-0"><p className="truncate font-semibold">{suggestion.domainName}</p><div className="mt-1 flex items-center gap-2"><span className={`size-2 rounded-full ${available ? "bg-teal-500" : checking ? "animate-pulse bg-amber-400" : failed ? "bg-rose-400" : "bg-slate-400"}`} /><span className="text-xs text-muted-foreground">{availabilityLabel(suggestion.status)}</span>{suggestion.isPremium && <Badge variant="outline">Premium</Badge>}</div></div>
+      <div className="sm:min-w-40 sm:text-right">{available ? <DomainPrice suggestion={suggestion} /> : checking ? <div className="h-6 w-28 animate-pulse rounded bg-muted" /> : null}</div>
+      <div className="sm:w-44">{available ? <Button className="w-full" variant="outline" onClick={() => onSelect(suggestion)} disabled={pending || (selected && checkoutReady)}>{selected && checkoutReady ? "Checkout ready" : "Choose"}<ArrowRight /></Button> : checking ? <Button className="w-full" variant="outline" disabled><LoaderCircle className="animate-spin" />Checking</Button> : failed ? <Button className="w-full" variant="outline" onClick={() => onRetry(suggestion)}><RefreshCcw />Retry</Button> : null}</div>
     </div>;
   })}</div>;
 }
 
 export function SearchAndBuy({ token }: { token: string }) {
   const [query, setQuery] = useState(""); const [suggestions, setSuggestions] = useState<SearchResult[]>([]); const [result, setResult] = useState<SearchResult | null>(null); const [quote, setQuote] = useState<Quote | null>(null);
-  const [contact, setContact] = useState(emptyContact); const [searching, setSearching] = useState(false); const [retryVersion, setRetryVersion] = useState(0); const [searchError, setSearchError] = useState(""); const [pending, setPending] = useState(false); const [error, setError] = useState(""); const [order, setOrder] = useState<DomainOrder | null>(null);
+  const [contact, setContact] = useState(emptyContact); const [searching, setSearching] = useState(false); const [submittedQuery, setSubmittedQuery] = useState(""); const [searchError, setSearchError] = useState(""); const [pending, setPending] = useState(false); const [error, setError] = useState(""); const [order, setOrder] = useState<DomainOrder | null>(null);
+  const [alternativeDomain, setAlternativeDomain] = useState("");
+  const [hasMoreSuggestions, setHasMoreSuggestions] = useState(false);
+  const [nextSuggestionOffset, setNextSuggestionOffset] = useState(0);
+  const [loadingMoreSuggestions, setLoadingMoreSuggestions] = useState(false);
+  const [searchMetrics, setSearchMetrics] = useState<{ exactMs?: number; firstAlternativeMs?: number; firstSuggestionMs?: number; firstFiveMs?: number; upstreamCallCount: number; errorCount: number }>({ upstreamCallCount: 0, errorCount: 0 });
   const [purchaseKey, setPurchaseKey] = useState("");
   const [purchaseToast, setPurchaseToast] = useState<{ title: string; message: string } | null>(null);
   const latestSearchId = useRef(0);
+  const activeSearch = useRef<{ query: string; controller: AbortController; pending: boolean } | null>(null);
+  const renewalRequests = useRef(new Set<string>());
+  const searchStartedAt = useRef(0);
+  const initialCompleted = useRef(new Set<string>());
+  const loadMoreAnchor = useRef<HTMLDivElement | null>(null);
+  const loadMoreRequest = useRef<() => Promise<void>>(async () => {});
+  const autoLoadedSearchId = useRef(0);
   const searchQuery = query.trim();
-  useEffect(() => {
-    const currentQuery = query.trim();
-    const searchId = ++latestSearchId.current;
-    setResult(null); setQuote(null); setOrder(null); setError(""); setSearchError(""); setSuggestions([]);
-    if (currentQuery.length < 2) { setSuggestions([]); setSearching(false); return; }
-    let active = true;
-    const controller = new AbortController();
-    let checkingDeadline: number | undefined;
-    const isCurrent = () => active && latestSearchId.current === searchId;
-    const checkBatchQueue = async (initialJobs: Array<{ domainNames: string[]; attempt: number; readyAt: number }>) => {
-      const jobs = [...initialJobs];
-      let cursor = 0;
-      const worker = async () => {
-        while (isCurrent() && cursor < jobs.length) {
-          const job = jobs[cursor++];
-          const delay = Math.max(0, job.readyAt - Date.now());
-          if (delay) await new Promise((resolve) => window.setTimeout(resolve, delay));
+  useEffect(() => () => activeSearch.current?.controller.abort(), []);
+
+  const fallbackPrimaryName = (value: string) => {
+    const cleaned = value.trim().toLowerCase().replace(/^https?:\/\//, "").split(/[/?#]/)[0].replace(/\.$/, "");
+    return cleaned.includes(".") ? cleaned : `${cleaned}.com`;
+  };
+
+  const loadRenewalPrices = (items: SearchResult[], controller: AbortController, searchId: number) => {
+    for (const item of items.filter((value) => value.liveVerified === true && value.status === "AVAILABLE" && value.isPremium)) {
+      if (renewalRequests.current.has(item.domainName)) continue;
+      renewalRequests.current.add(item.domainName);
+      setSuggestions((current) => current.map((value) => value.domainName === item.domainName ? { ...value, renewalPricingStatus: "LOADING" } : value));
+      void domainApi<RenewalPriceResponse>(token, "/v1/domain/search/premium-renewal", {
+        method: "POST",
+        signal: boundedSearchSignal(controller.signal, 12_000),
+        body: JSON.stringify({ domainName: item.domainName }),
+      }).then((renewal) => {
+        if (latestSearchId.current !== searchId) return;
+        setSuggestions((current) => current.map((value) => value.domainName === renewal.domainName ? { ...value, renewalPricing: renewal.renewalPricing, renewalPricingStatus: renewal.renewalPricingStatus } : value));
+      }).catch(() => {
+        if (latestSearchId.current === searchId) setSuggestions((current) => current.map((value) => value.domainName === item.domainName ? { ...value, renewalPricingStatus: "UNKNOWN" } : value));
+      });
+    }
+  };
+
+  const previewResult = (domainName: string, exact = false): SearchResult => ({
+    domainName,
+    status: "PREVIEW",
+    liveVerified: false,
+    estimated: false,
+    checkFailed: false,
+    isPremium: false,
+    isDocumentRequired: false,
+    period: 1,
+    pricing: { customerAmount: null, customerCurrency: null },
+    badges: exact ? ["EXACT_MATCH"] : [],
+    renewalPricingStatus: "UNKNOWN",
+  });
+
+  const streamSuggestionPage = async ({ currentQuery, offset, searchId, controller, initial }: { currentQuery: string; offset: number; searchId: number; controller: AbortController; initial: boolean }) => {
+    const pageDomains: string[] = [];
+    if (!initial) setLoadingMoreSuggestions(true);
+    const isCurrent = () => isCurrentDomainSearch(latestSearchId.current, searchId, controller.signal.aborted);
+    try {
+      await domainNdjsonStream<SmartStreamEvent>(
+        token,
+        "/v1/domain/search/smart/suggestions/stream",
+        { query: currentQuery, offset, limit: 5 },
+        boundedSearchSignal(controller.signal, 25_000),
+        async (event) => {
           if (!isCurrent()) return;
-          let unresolved = job.domainNames;
-          let shouldRetry = false;
-          try {
-            const response = await domainApi<StagedSearchResponse>(token, "/v1/domain/search/smart/retry", {
-              method: "POST",
-              signal: AbortSignal.any([controller.signal, AbortSignal.timeout(25_000)]),
-              body: JSON.stringify({ domainNames: job.domainNames }),
-            });
-            if (!isCurrent()) return;
-            setSuggestions((current) => mergeSearchResults(current, response.results || []));
-            const verified = new Set((response.results || []).filter((item) => item.liveVerified === true).map((item) => item.domainName));
-            unresolved = job.domainNames.filter((domainName) => !verified.has(domainName));
-            shouldRetry = unresolved.length > 0;
-          } catch (batchCause) {
-            if (controller.signal.aborted) return;
-            shouldRetry = true;
+          if (event.type === "meta") {
+            pageDomains.push(...event.candidates);
+            setSuggestions((current) => mergeSearchResults(current, event.candidates.map((domainName) => previewResult(domainName))));
+            setHasMoreSuggestions(event.hasMore);
+            setNextSuggestionOffset(event.offset + event.candidates.length);
+          } else if (event.type === "result") {
+            setSuggestions((current) => mergeSearchResults(current, [event.result]));
+            loadRenewalPrices([event.result], controller, searchId);
+            const elapsedMs = Math.round(performance.now() - searchStartedAt.current);
+            if (initial) initialCompleted.current.add(event.result.domainName);
+            setSearchMetrics((current) => ({
+              ...current,
+              firstSuggestionMs: current.firstSuggestionMs ?? elapsedMs,
+              firstFiveMs: current.firstFiveMs ?? (initialCompleted.current.size >= 5 ? elapsedMs : undefined),
+            }));
+            if (isVerifiedAvailable(event.result)) {
+              setAlternativeDomain((current) => current || event.result.domainName);
+              setSearchMetrics((metrics) => ({ ...metrics, firstAlternativeMs: metrics.firstAlternativeMs ?? elapsedMs }));
+            }
+          } else if (event.type === "done") {
+            setHasMoreSuggestions(event.hasMore);
+            setNextSuggestionOffset(event.nextOffset);
+            setSearchMetrics((current) => ({ ...current, upstreamCallCount: current.upstreamCallCount + event.upstreamCallCount, errorCount: current.errorCount + event.errorCount }));
+          } else if (event.type === "error") {
+            throw new Error(event.message);
           }
-          if (unresolved.length && isCurrent()) {
-            setSuggestions((current) => markDomainsUnverified(current, unresolved));
-          }
-          if (shouldRetry && job.attempt === 0 && isCurrent()) {
-            jobs.push({ domainNames: unresolved, attempt: 1, readyAt: Date.now() + 4_000 });
-          }
-        }
-      };
-      await Promise.allSettled([worker(), worker()]);
-    };
-    const buildJobs = (domainNames: string[], batchSize: number) => {
-      const uniqueNames = [...new Set(domainNames.filter(Boolean))];
-      const jobs: Array<{ domainNames: string[]; attempt: number; readyAt: number }> = [];
-      for (let index = 0; index < uniqueNames.length; index += batchSize) {
-        jobs.push({ domainNames: uniqueNames.slice(index, index + batchSize), attempt: 0, readyAt: 0 });
-      }
-      return jobs;
-    };
-    const timer = window.setTimeout(async () => {
-      setSearching(true);
-      try {
-        const preview = await domainApi<{ results: SearchResult[] }>(token, "/v1/domain/search/smart/preview", { method: "POST", signal: controller.signal, body: JSON.stringify({ query: currentQuery }) });
+        },
+      );
+    } catch (cause) {
+      if (!isCurrent()) return;
+      setSuggestions((current) => markDomainsUnverified(current, pageDomains));
+      setSearchMetrics((current) => ({ ...current, errorCount: current.errorCount + Math.max(pageDomains.length, 1) }));
+      setSearchError(cause instanceof Error ? `Some suggestions could not be checked: ${cause.message}` : "Some suggestions could not be checked.");
+    } finally {
+      if (isCurrent() && !initial) setLoadingMoreSuggestions(false);
+    }
+  };
+
+  const runSearch = async (submittedQuery: string) => {
+    const currentQuery = submittedQuery.trim();
+    if (currentQuery.length < 2) return;
+    if (!shouldStartDomainSearch(activeSearch.current?.query || null, Boolean(activeSearch.current?.pending && !activeSearch.current.controller.signal.aborted), currentQuery)) return;
+
+    activeSearch.current?.controller.abort();
+    const controller = new AbortController();
+    const searchId = ++latestSearchId.current;
+    activeSearch.current = { query: currentQuery, controller, pending: true };
+    setSubmittedQuery(currentQuery);
+    renewalRequests.current.clear();
+    initialCompleted.current.clear();
+    autoLoadedSearchId.current = 0;
+    searchStartedAt.current = performance.now();
+    setAlternativeDomain(""); setHasMoreSuggestions(false); setNextSuggestionOffset(0); setLoadingMoreSuggestions(false); setSearchMetrics({ upstreamCallCount: 0, errorCount: 0 });
+    const exactDomain = fallbackPrimaryName(currentQuery);
+    setResult(null); setQuote(null); setOrder(null); setError(""); setSearchError(""); setSuggestions([previewResult(exactDomain, true)]); setSearching(true);
+    const isCurrent = () => isCurrentDomainSearch(latestSearchId.current, searchId, controller.signal.aborted);
+    const request = <T,>(path: string, timeoutMs: number) => domainApi<T>(token, path, {
+      method: "POST",
+      signal: boundedSearchSignal(controller.signal, timeoutMs),
+      body: JSON.stringify({ query: currentQuery }),
+    });
+
+    const primaryTask = request<PrimarySearchResponse>("/v1/domain/search/smart/primary", 25_000)
+      .then((primary) => {
         if (!isCurrent()) return;
-        setSuggestions(preview.results || []);
-        const visibleDomains = (preview.results || []).slice(0, 6).map((item) => item.domainName);
-        const backgroundDomains = (preview.results || []).slice(6).map((item) => item.domainName);
-        checkingDeadline = window.setTimeout(() => {
-          if (isCurrent()) setSuggestions((current) => markDomainsUnverified(current, current.filter((item) => item.status === "PREVIEW").map((item) => item.domainName)));
-        }, 3_000);
-        setSearching(false);
-        void checkBatchQueue([
-          ...buildJobs(visibleDomains, 2),
-          ...buildJobs(backgroundDomains, 6),
-        ]);
-      } catch (cause) {
-        if (cause instanceof Error && cause.name === "AbortError") return;
-        if (isCurrent()) setSearchError(cause instanceof Error ? cause.message : "We couldn't check availability right now. Please try again in a moment.");
-      } finally {
-        if (isCurrent()) setSearching(false);
-      }
-    }, 100);
-    return () => { active = false; controller.abort(); window.clearTimeout(timer); if (checkingDeadline) window.clearTimeout(checkingDeadline); };
-  }, [query, retryVersion, token]);
-  const searchDomain = (event: FormEvent) => { event.preventDefault(); if (!searching && searchQuery.length >= 2) setRetryVersion((value) => value + 1); };
+        const exact = { ...primary.result, badges: [...new Set([...(primary.result.badges || []), "EXACT_MATCH" as const])] };
+        setSuggestions((current) => mergeSearchResults(current, [exact]));
+        setSearchMetrics((current) => ({ ...current, exactMs: Math.round(performance.now() - searchStartedAt.current), upstreamCallCount: current.upstreamCallCount + Number(exact.metrics?.upstreamCallCount || 0) }));
+        loadRenewalPrices([exact], controller, searchId);
+      })
+      .catch((cause) => {
+        if (!isCurrent()) return;
+        const domainName = exactDomain;
+        setSuggestions((current) => mergeSearchResults(current, [{
+          domainName, status: "UNKNOWN", liveVerified: false, checkFailed: true, reason: cause instanceof Error ? cause.message : "Availability could not be checked.",
+          isPremium: false, isDocumentRequired: false, period: 1, pricing: { customerAmount: null, customerCurrency: null }, badges: ["EXACT_MATCH"], renewalPricingStatus: "UNKNOWN",
+        }]));
+        setSearchMetrics((current) => ({ ...current, exactMs: Math.round(performance.now() - searchStartedAt.current), errorCount: current.errorCount + 1 }));
+      });
+
+    const suggestionsTask = streamSuggestionPage({ currentQuery, offset: 0, searchId, controller, initial: true });
+
+    await Promise.allSettled([primaryTask, suggestionsTask]);
+    if (isCurrent()) {
+      setSearching(false);
+      activeSearch.current = { query: currentQuery, controller, pending: false };
+    }
+  };
+
+  const searchDomain = (event: FormEvent) => { event.preventDefault(); void runSearch(searchQuery); };
+
+  const loadMore = async () => {
+    const active = activeSearch.current;
+    if (!active || !hasMoreSuggestions || loadingMoreSuggestions) return;
+    await streamSuggestionPage({ currentQuery: active.query, offset: nextSuggestionOffset, searchId: latestSearchId.current, controller: active.controller, initial: false });
+  };
+  useEffect(() => {
+    loadMoreRequest.current = loadMore;
+  });
+
+  useEffect(() => {
+    const node = loadMoreAnchor.current;
+    if (!node || !hasMoreSuggestions || loadingMoreSuggestions || autoLoadedSearchId.current === latestSearchId.current) return;
+    const observer = new IntersectionObserver((entries) => {
+      if (!entries.some((entry) => entry.isIntersecting)) return;
+      autoLoadedSearchId.current = latestSearchId.current;
+      observer.disconnect();
+      void loadMoreRequest.current();
+    }, { rootMargin: "240px" });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [hasMoreSuggestions, loadingMoreSuggestions, nextSuggestionOffset]);
+
+  const retrySuggestion = async (suggestion: SearchResult) => {
+    const active = activeSearch.current;
+    if (!active) return;
+    const searchId = latestSearchId.current;
+    setSuggestions((current) => current.map((item) => item.domainName === suggestion.domainName ? { ...item, status: "PREVIEW", liveVerified: false, checkFailed: false } : item));
+    try {
+      const value = await domainApi<SearchResult>(token, "/v1/domain/search", {
+        method: "POST",
+        signal: boundedSearchSignal(active.controller.signal, 10_000),
+        body: JSON.stringify({ domainName: suggestion.domainName }),
+      });
+      if (!isCurrentDomainSearch(latestSearchId.current, searchId, active.controller.signal.aborted)) return;
+      const verified = !["UNKNOWN", "NONE", "ERROR"].includes(value.status);
+      const next = { ...value, liveVerified: verified, checkFailed: !verified, badges: suggestion.badges || [], renewalPricingStatus: value.isPremium ? "NOT_LOADED" as const : "NOT_APPLICABLE" as const };
+      setSuggestions((current) => mergeSearchResults(current, [next]));
+      loadRenewalPrices([next], active.controller, searchId);
+    } catch {
+      if (latestSearchId.current === searchId) setSuggestions((current) => markDomainsUnverified(current, [suggestion.domainName]));
+    }
+  };
   const createQuote = async (selected: SearchResult) => {
     setResult(selected); setQuote(null); setOrder(null); setPurchaseKey(""); setPending(true); setError("");
     try {
@@ -444,18 +644,29 @@ export function SearchAndBuy({ token }: { token: string }) {
     }
   };
   const purchase = async (event: FormEvent) => { event.preventDefault(); if (!quote || !purchaseKey) return; setError(""); setPurchaseToast(null); setPending(true); try { const currentWallet = await domainApi<Wallet>(token, "/v1/domain/wallet"); if (currentWallet.availableCredits < quote.pricing.customerAmount) { const shortfall = quote.pricing.customerAmount - currentWallet.availableCredits; setPurchaseToast({ title: "Insufficient credits", message: `Please add ${formatDomainAmount(shortfall, quote.pricing.customerCurrency)} more credits to purchase this domain.` }); return; } const contacts = ["Registrant", "Admin", "Tech", "Billing"].map((contactType) => ({ ...contact, contactType })); const value = await domainApi<DomainOrder>(token, "/v1/domain/purchases/registration", { method: "POST", headers: { "Idempotency-Key": purchaseKey }, body: JSON.stringify({ quoteId: quote.quoteId, contacts, tldAttributes: {}, useTrusteeContact: false }) }); setOrder(value); } catch (cause) { const message = cause instanceof Error ? cause.message : "Registration failed."; const code = cause instanceof DomainApiError ? cause.code : ""; setPurchaseToast({ title: code === "INSUFFICIENT_DOMAIN_CREDITS" ? "Insufficient credits" : code === "DOMAIN_NAMESERVERS_NOT_CONFIGURED" ? "Domain purchase unavailable" : "Purchase could not be completed", message }); } finally { setPending(false); } };
-  const visibleSuggestions = suggestions;
-  const showSearchLoading = searchQuery.length >= 2 && !searchError && visibleSuggestions.length === 0;
+  const exactSuggestion = suggestions.find((item) => (item.badges || []).includes("EXACT_MATCH"));
+  const alternativeSuggestion = suggestions.find((item) => item.domainName === alternativeDomain && isVerifiedAvailable(item));
+  const compactSuggestions = suggestions.filter((item) => !(item.badges || []).includes("EXACT_MATCH") && item.domainName !== alternativeDomain);
+  const alternativeLoading = !alternativeSuggestion && (searching || loadingMoreSuggestions || suggestions.some((item) => !(item.badges || []).includes("EXACT_MATCH") && item.status === "PREVIEW"));
   return <div className="space-y-6"><PageHeading title="Search & Buy Domain" description="Type a name to see live availability and prices." />
     {purchaseToast && <div role="alert" aria-live="assertive" className="fixed top-5 right-5 z-50 flex w-[calc(100%-2.5rem)] max-w-md items-start gap-3 rounded-xl border border-amber-300 bg-amber-50 p-4 text-amber-950 shadow-lg"><TriangleAlert className="mt-0.5 size-5 shrink-0" /><div className="min-w-0 flex-1"><p className="font-medium">{purchaseToast.title}</p><p className="mt-1 text-sm">{purchaseToast.message}</p></div><button type="button" onClick={() => setPurchaseToast(null)} className="rounded-md px-2 py-1 text-sm font-medium hover:bg-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-600">Dismiss</button></div>}
-    <Card className="border-primary/40 bg-primary/10"><CardContent><form className="flex flex-col gap-2 sm:flex-row" onSubmit={searchDomain}><div className="relative flex-1"><Search className="absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" /><Input value={query} onChange={(event) => setQuery(event.target.value)} required autoComplete="off" placeholder="Type your domain name" className="h-11 pl-9" aria-label="Domain name" /></div><Button className="h-11 bg-teal-700 text-white hover:bg-teal-800 disabled:bg-teal-700 disabled:text-white disabled:opacity-70 sm:px-6" disabled={searching || searchQuery.length < 2}>{searching ? <LoaderCircle className="animate-spin" /> : <Search />}Search Domains</Button></form></CardContent></Card>
-    {searchQuery.length < 2 && <Card className="overflow-hidden border-0 bg-gradient-to-br from-emerald-950 via-teal-900 to-slate-950 text-white shadow-lg"><CardContent className="p-0"><div className="grid min-h-80 lg:grid-cols-[1.3fr_0.7fr]"><div className="flex flex-col justify-center p-7 sm:p-10 lg:p-12"><Badge className="mb-5 w-fit border-white/20 bg-white/10 text-white hover:bg-white/10">SellersLogin Domains</Badge><h3 className="max-w-2xl text-3xl font-semibold tracking-tight sm:text-4xl">Your next big idea deserves the right domain.</h3><p className="mt-4 max-w-xl text-sm leading-6 text-white/75 sm:text-base">Search your business name and compare available domain options. Any eligible first-year or multi-year discount is applied automatically.</p><div className="mt-7 flex flex-wrap gap-x-6 gap-y-3 text-sm text-white/85"><span className="flex items-center gap-2"><ShieldCheck className="size-4 text-emerald-300" />Clear total before purchase</span><span className="flex items-center gap-2"><WalletCards className="size-4 text-emerald-300" />Pay with wallet credits</span><span className="flex items-center gap-2"><Globe2 className="size-4 text-emerald-300" />DNS tools included</span></div></div><div className="m-5 flex flex-col justify-center rounded-2xl border border-white/15 bg-white/10 p-6 backdrop-blur-sm lg:m-7"><p className="text-sm font-medium text-emerald-200">Popular domain endings</p><p className="mt-2 text-lg font-semibold">Search a name with any popular ending.</p><div className="mt-5 grid grid-cols-2 gap-3">{["com", "in", "co.in", "net"].map((extension) => <div key={extension} className="rounded-xl border border-white/15 bg-white/10 px-4 py-3 font-semibold"><span className="text-emerald-200">.</span>{extension}</div>)}</div><p className="mt-5 text-xs leading-5 text-white/65">Offer duration, later-year price and the full amount payable are shown before checkout.</p></div></div></CardContent></Card>}
-    {searchError && <ErrorState message={searchError} retry={() => { setSearchError(""); setRetryVersion((value) => value + 1); }} />}
+    <Card className="border-primary/40 bg-primary/10"><CardContent><form className="flex flex-col gap-2 sm:flex-row" onSubmit={searchDomain}><div className="relative flex-1"><Search className="absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" /><Input value={query} onChange={(event) => setQuery(event.target.value)} required autoComplete="off" placeholder="Type your domain name" className="h-11 pl-9" aria-label="Domain name" /></div><Button className="h-11 bg-teal-700 text-white hover:bg-teal-800 disabled:bg-teal-700 disabled:text-white disabled:opacity-70 sm:px-6" disabled={searchQuery.length < 2}>{searching ? <LoaderCircle className="animate-spin" /> : <Search />}{searching ? "Searching" : "Search Domains"}</Button></form></CardContent></Card>
+    {!submittedQuery && <Card className="overflow-hidden border-0 bg-gradient-to-br from-emerald-950 via-teal-900 to-slate-950 text-white shadow-lg"><CardContent className="p-0"><div className="grid min-h-80 lg:grid-cols-[1.3fr_0.7fr]"><div className="flex flex-col justify-center p-7 sm:p-10 lg:p-12"><Badge className="mb-5 w-fit border-white/20 bg-white/10 text-white hover:bg-white/10">SellersLogin Domains</Badge><h3 className="max-w-2xl text-3xl font-semibold tracking-tight sm:text-4xl">Your next big idea deserves the right domain.</h3><p className="mt-4 max-w-xl text-sm leading-6 text-white/75 sm:text-base">Search your business name and compare available domain options. Any eligible first-year or multi-year discount is applied automatically.</p><div className="mt-7 flex flex-wrap gap-x-6 gap-y-3 text-sm text-white/85"><span className="flex items-center gap-2"><ShieldCheck className="size-4 text-emerald-300" />Clear total before purchase</span><span className="flex items-center gap-2"><WalletCards className="size-4 text-emerald-300" />Pay with wallet credits</span><span className="flex items-center gap-2"><Globe2 className="size-4 text-emerald-300" />DNS tools included</span></div></div><div className="m-5 flex flex-col justify-center rounded-2xl border border-white/15 bg-white/10 p-6 backdrop-blur-sm lg:m-7"><p className="text-sm font-medium text-emerald-200">Popular domain endings</p><p className="mt-2 text-lg font-semibold">Search a name with any popular ending.</p><div className="mt-5 grid grid-cols-2 gap-3">{["com", "in", "co.in", "net"].map((extension) => <div key={extension} className="rounded-xl border border-white/15 bg-white/10 px-4 py-3 font-semibold"><span className="text-emerald-200">.</span>{extension}</div>)}</div><p className="mt-5 text-xs leading-5 text-white/65">Offer duration, later-year price and the full amount payable are shown before checkout.</p></div></div></CardContent></Card>}
+    {searchError && <ErrorState message={searchError} retry={() => { setSearchError(""); void runSearch(submittedQuery); }} />}
     {error && <ErrorState message={error} />}
-    {searchQuery.length >= 2 && (!searchError || suggestions.length > 0) && <Card>
-      <CardHeader><CardTitle>Choose your domain</CardTitle><CardDescription>{showSearchLoading ? "Preparing domain suggestions..." : searching ? "Verifying live availability and prices..." : "Domain's by SellersLogin"}</CardDescription></CardHeader>
-      <CardContent className="p-0">{showSearchLoading ? <DomainSearchLoading /> : <DomainSuggestionRows suggestions={visibleSuggestions} selectedDomain={result?.domainName} checkoutReady={Boolean(quote)} pending={pending} onSelect={createQuote} />}</CardContent>
-    </Card>}
+    {submittedQuery && <section className="space-y-6" aria-live="polite">
+      <div className="grid gap-4 lg:grid-cols-2">
+        <FeaturedDomainCard title="Your searched domain" suggestion={exactSuggestion} loading={!exactSuggestion} selectedDomain={result?.domainName} checkoutReady={Boolean(quote)} pending={pending} onSelect={createQuote} onRetry={retrySuggestion} />
+        <FeaturedDomainCard title="Recommended alternative" suggestion={alternativeSuggestion} loading={alternativeLoading} selectedDomain={result?.domainName} checkoutReady={Boolean(quote)} pending={pending} onSelect={createQuote} onRetry={retrySuggestion} />
+      </div>
+      <Card className="overflow-hidden">
+        <CardHeader className="border-b bg-muted/20"><div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between"><div><CardTitle>More domain suggestions</CardTitle><CardDescription>Live availability and your SellersLogin price appear as each check completes.</CardDescription></div><p className="text-xs text-muted-foreground">{searchMetrics.firstFiveMs ? `First 5 completed in ${(searchMetrics.firstFiveMs / 1000).toFixed(1)}s` : searching ? "Checking priority suggestions…" : `${compactSuggestions.length} suggestions checked`}</p></div></CardHeader>
+        <CardContent className="p-0">{compactSuggestions.length ? <CompactSuggestionRows suggestions={compactSuggestions} selectedDomain={result?.domainName} checkoutReady={Boolean(quote)} pending={pending} onSelect={createQuote} onRetry={retrySuggestion} /> : <div className="p-8 text-center text-sm text-muted-foreground">Suggestions will appear here as live checks start.</div>}</CardContent>
+        <div ref={loadMoreAnchor} className="border-t p-4 text-center">
+          {hasMoreSuggestions ? <Button type="button" variant="outline" onClick={() => void loadMore()} disabled={loadingMoreSuggestions}>{loadingMoreSuggestions ? <LoaderCircle className="animate-spin" /> : <RefreshCcw />}{loadingMoreSuggestions ? "Checking more…" : "Show more suggestions"}</Button> : <p className="text-xs text-muted-foreground">All requested suggestions have been checked.</p>}
+        </div>
+      </Card>
+    </section>}
     {quote && !order && <Card id="domain-checkout-form"><CardHeader><CardTitle>Registrant details</CardTitle><CardDescription>Complete the details for {quote.domainName}. SellersLogin configures DNS automatically, and nameservers can be changed after purchase.</CardDescription></CardHeader><CardContent><form className="grid gap-4 sm:grid-cols-2" onSubmit={purchase}>{Object.entries(contact).map(([key, value]) => <div key={key} className="space-y-2"><Label htmlFor={key}>{key.replace(/([A-Z])/g, " $1").replace(/^./, (letter) => letter.toUpperCase())}</Label><Input id={key} type={key === "eMail" ? "email" : "text"} value={value} required={key !== "companyName"} onChange={(event) => setContact((current) => ({ ...current, [key]: event.target.value }))} /></div>)}<div className="rounded-md border bg-muted/30 p-4 sm:col-span-2">{quote.pricing.campaign && <div className="mb-3 space-y-1 text-sm"><div className="flex justify-between"><span>First year promotional price</span><span>{formatDomainAmount(quote.pricing.campaign.firstYearPrice, quote.pricing.customerCurrency)}</span></div><div className="flex justify-between"><span>Additional {quote.pricing.campaign.requiredYears - 1} years</span><span>{formatDomainAmount(quote.pricing.campaign.additionalYearPrice * (quote.pricing.campaign.requiredYears - 1), quote.pricing.customerCurrency)}</span></div></div>}<div className="flex items-center justify-between border-t pt-3"><div><p className="font-medium">Total: {formatDomainAmount(quote.pricing.customerAmount, quote.pricing.customerCurrency)}</p><p className="text-xs text-muted-foreground">{quote.period}-year term · Paid from SellersLogin credits · Quote expires {formatDomainDate(quote.expiresAt)}</p></div><Button disabled={pending}>{pending ? <LoaderCircle className="animate-spin" /> : <CreditCard />}Confirm purchase</Button></div></div></form></CardContent></Card>}
     {order && <Card className="border-primary"><CardContent className="flex items-start gap-3 py-6"><CheckCircle2 className="size-5 text-primary" /><div><p className="font-medium">Order {order.status.replaceAll("_", " ")}</p><p className="text-sm text-muted-foreground">Order ID: {order.orderId}</p></div></CardContent></Card>}
   </div>;

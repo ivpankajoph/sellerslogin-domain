@@ -66,6 +66,61 @@ export async function domainApi<T>(
   return payload.data as T;
 }
 
+export async function domainNdjsonStream<T>(
+  token: string,
+  path: string,
+  body: unknown,
+  signal: AbortSignal,
+  onEvent: (event: T) => void | Promise<void>,
+) {
+  let response: Response;
+  try {
+    response = await fetch(`${domainApiBase}${path}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        Accept: "application/x-ndjson",
+      },
+      body: JSON.stringify(body),
+      cache: "no-store",
+      signal,
+    });
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") throw error;
+    throw new DomainApiError("The domain service is temporarily unavailable. Please try again shortly.", 0, "DOMAIN_SERVICE_UNREACHABLE");
+  }
+  if (!response.ok || !response.body) {
+    const payload = await response.json().catch(() => ({}));
+    throw new DomainApiError(
+      sellersLoginErrorMessage(payload?.message || payload?.error, "Suggestions could not be checked."),
+      response.status,
+      payload?.code,
+    );
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const consumeLines = async (final = false) => {
+    const lines = buffer.split("\n");
+    buffer = final ? "" : lines.pop() || "";
+    for (const line of lines) {
+      const value = line.trim();
+      if (value) await onEvent(JSON.parse(value) as T);
+    }
+    if (final && buffer.trim()) await onEvent(JSON.parse(buffer.trim()) as T);
+  };
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    await consumeLines();
+  }
+  buffer += decoder.decode();
+  await consumeLines(true);
+}
+
 export function createIdempotencyKey(prefix: string) {
   const random = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   return `${prefix}:${random}`;
