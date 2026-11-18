@@ -60,7 +60,7 @@ type ProviderStatus = {
 };
 
 type DashboardData = {
-  domains: { total: number; active: number; expiringSoon: number; vendors: number };
+  domains: { total: number; active: number; expiringSoon: number; vendors: number; providerAutoRenew: number };
   provider: ProviderStatus;
 };
 
@@ -172,6 +172,9 @@ export function SuperAdminDashboard({
     }
     if (dashboard?.provider.environment === "production" && !dashboard.provider.resellerAutoRenewSafetyAcknowledged) {
       items.push({ title: "Auto-renew safety not confirmed", detail: "Confirm the renewal policy before enabling production purchases.", icon: TriangleAlert, badge: "Required" });
+    }
+    if (dashboard?.domains.providerAutoRenew) {
+      items.push({ title: "Provider auto-renew domains detected", detail: `${dashboard.domains.providerAutoRenew} synced domain${dashboard.domains.providerAutoRenew === 1 ? " is" : "s are"} still set to AutoRenew. Change them to AutoExpire in the reseller panel to prevent automatic balance deductions.`, icon: TriangleAlert, badge: String(dashboard.domains.providerAutoRenew) });
     }
     if (reconciliationOrders) {
       items.push({ title: "Orders require reconciliation", detail: `${reconciliationOrders} domain operation${reconciliationOrders === 1 ? "" : "s"} need admin review.`, icon: Activity, badge: String(reconciliationOrders) });

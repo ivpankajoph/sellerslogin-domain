@@ -78,10 +78,32 @@ type RenewalPriceResponse = { domainName: string; renewalPricing: SearchResult["
 type Quote = {
   quoteId: string;
   domainName: string;
+  operation?: "RENEW" | "RESTORE";
   period: number;
   expiresAt: string;
   pricing: { customerAmount: number; customerCurrency: string; regularAmount?: number; discountAmount?: number; taxCollectionMode?: string; campaign?: { name: string; firstYearPrice: number; additionalYearPrice: number; requiredYears: number } | null };
 };
+type RenewalItem = {
+  domainName: string;
+  unicodeDomainName?: string;
+  status?: unknown;
+  statusReason?: string;
+  expirationDate?: string | null;
+  recoveryDeadline?: string | null;
+  renewalMode?: string;
+  providerAutoRenewRisk: boolean;
+  renewalPeriods: number[];
+  lifecycle: {
+    stage: "ACTIVE" | "DUE_SOON" | "EXPIRED" | "REDEMPTION" | "PENDING_DELETE";
+    daysRemaining: number | null;
+    canRenew: boolean;
+    canRestore: boolean;
+    autoRenewGracePeriodDays?: number | null;
+    redemptionPeriodDays?: number | null;
+  };
+  pendingOrder?: { orderId: string; operation: "RENEW" | "RESTORE"; status: string } | null;
+};
+type RenewalResponse = PageResult<RenewalItem> & { wallet: Wallet };
 
 function ErrorState({ message, retry }: { message: string; retry?: () => void }) {
   return (
@@ -203,7 +225,7 @@ export function VendorOverview({ token }: { token: string }) {
   const cards = [
     { label: "Owned domains", value: domains?.total, description: "Domains in your account", icon: Globe2 },
     { label: "Expiring soon", value: expiringSoon, description: "Within the next 60 days", icon: Clock3 },
-    { label: "Provider auto-renew", value: autoRenew, description: "Provider renewal mode", icon: RefreshCcw },
+    { label: "Automatic renewal", value: autoRenew, description: "Domains currently set to auto-renew", icon: RefreshCcw },
     { label: "Wallet balance", value: wallet ? `${wallet.availableCredits.toLocaleString("en-IN")} ${wallet.currency}` : null, description: wallet ? `${wallet.reservedCredits.toLocaleString("en-IN")} reserved` : "Available credits", icon: WalletCards },
   ];
   return <div className="space-y-6">
@@ -696,10 +718,76 @@ export function Transfers({ token }: { token: string }) {
 }
 
 export function Renewals({ token }: { token: string }) {
-  const domains = useResource<PageResult<DomainAsset>>(token, "/v1/domain/domains?page=1&limit=100"); const [selected, setSelected] = useState(""); const [period, setPeriod] = useState(1); const [quote, setQuote] = useState<Quote | null>(null); const [pending, setPending] = useState(false); const [error, setError] = useState(""); const [message, setMessage] = useState("");
-  const getQuote = async () => { setPending(true); setError(""); setMessage(""); try { setQuote(await domainApi<Quote>(token, "/v1/domain/quotes/renewal", { method: "POST", body: JSON.stringify({ domainName: selected, period }) })); } catch (cause) { setError(cause instanceof Error ? cause.message : "Renewal quote failed."); } finally { setPending(false); } };
-  const renew = async () => { if (!quote) return; setPending(true); setError(""); try { const order = await domainApi<DomainOrder>(token, "/v1/domain/purchases/renewal", { method: "POST", headers: { "Idempotency-Key": createIdempotencyKey("domain-renew") }, body: JSON.stringify({ quoteId: quote.quoteId }) }); setMessage(`Renewal order ${order.status.replaceAll("_", " ")}.`); setQuote(null); } catch (cause) { setError(cause instanceof Error ? cause.message : "Renewal failed."); } finally { setPending(false); } };
-  return <div className="space-y-6"><PageHeading title="Renewals" description="Review expiry dates and renew using a fresh SellersLogin quote." />{error && <ErrorState message={error} />}{message && <div className="rounded-lg border border-primary/40 bg-primary/10 p-4 text-sm">{message}</div>}<Card><CardHeader><CardTitle>Renew a domain</CardTitle><CardDescription>Select one of your owned domains.</CardDescription></CardHeader><CardContent className="grid gap-4 sm:grid-cols-3"><div className="space-y-2 sm:col-span-2"><Label>Domain</Label><select className="h-9 w-full rounded-md border bg-transparent px-3 text-sm" value={selected} onChange={(event) => { setSelected(event.target.value); setQuote(null); }}><option value="">Select a domain</option>{domains.data?.items.map((domain) => <option key={domain.domainName} value={domain.domainName}>{domain.domainName} — {formatDomainDate(domain.expirationDate)}</option>)}</select></div><div className="space-y-2"><Label>Years</Label><Input type="number" min={1} max={10} value={period} onChange={(event) => setPeriod(Number(event.target.value))} /></div><Button disabled={!selected || pending} onClick={getQuote} className="sm:col-span-3">Get renewal quote</Button></CardContent></Card>{quote && <Card><CardContent className="flex items-center justify-between gap-4 py-6"><div><p className="font-medium">{quote.domainName}</p><p className="text-2xl font-semibold">{formatDomainAmount(quote.pricing.customerAmount, quote.pricing.customerCurrency)}</p></div><Button disabled={pending} onClick={renew}>Confirm renewal</Button></CardContent></Card>}</div>;
+  const renewals = useResource<RenewalResponse>(token, "/v1/domain/renewals?page=1&limit=100");
+  const [selected, setSelected] = useState<RenewalItem | null>(null);
+  const [period, setPeriod] = useState(1);
+  const [quote, setQuote] = useState<Quote | null>(null);
+  const [action, setAction] = useState<"RENEW" | "RESTORE">("RENEW");
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
+  const checkoutKeys = useRef(new Map<string, string>());
+
+  const selectDomain = (item: RenewalItem) => {
+    const periods = item.renewalPeriods.length ? item.renewalPeriods : [1];
+    setSelected(item); setQuote(null); setError(""); setMessage("");
+    setPeriod(periods.includes(1) ? 1 : periods[0]);
+    setAction(item.lifecycle.canRestore ? "RESTORE" : "RENEW");
+  };
+
+  const getQuote = async () => {
+    if (!selected) return;
+    setPending(true); setError(""); setMessage("");
+    try {
+      const restoring = selected.lifecycle.canRestore;
+      const path = restoring ? "/v1/domain/quotes/restore" : "/v1/domain/quotes/renewal";
+      const body = restoring ? { domainName: selected.domainName } : { domainName: selected.domainName, period };
+      const value = await domainApi<Quote>(token, path, { method: "POST", body: JSON.stringify(body) });
+      setAction(restoring ? "RESTORE" : "RENEW"); setQuote(value);
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "The latest renewal price could not be loaded."); }
+    finally { setPending(false); }
+  };
+
+  const confirm = async () => {
+    if (!quote) return;
+    setPending(true); setError("");
+    try {
+      if (!checkoutKeys.current.has(quote.quoteId)) checkoutKeys.current.set(quote.quoteId, createIdempotencyKey(`domain-${action.toLowerCase()}`));
+      const order = await domainApi<DomainOrder>(token, action === "RESTORE" ? "/v1/domain/purchases/restore" : "/v1/domain/purchases/renewal", {
+        method: "POST",
+        headers: { "Idempotency-Key": checkoutKeys.current.get(quote.quoteId)! },
+        body: JSON.stringify({ quoteId: quote.quoteId }),
+      });
+      setMessage(`${action === "RESTORE" ? "Recovery" : "Renewal"} order ${order.status.replaceAll("_", " ").toLowerCase()}.`);
+      setQuote(null); setSelected(null); renewals.reload();
+    } catch (cause) { if (cause instanceof DomainApiError && cause.code === "INSUFFICIENT_DOMAIN_CREDITS") { setQuote(null); renewals.reload(); } setError(cause instanceof Error ? cause.message : `${action === "RESTORE" ? "Recovery" : "Renewal"} could not be completed.`); }
+    finally { setPending(false); }
+  };
+
+  const stageLabel = (item: RenewalItem) => ({ ACTIVE: "Active", DUE_SOON: `${Math.max(item.lifecycle.daysRemaining || 0, 0)} days left`, EXPIRED: "Expired", REDEMPTION: "Redemption", PENDING_DELETE: "Pending deletion" }[item.lifecycle.stage]);
+  const renewalModeLabel = (mode?: string) => ({ autorenew: "Automatic renewal", autoexpire: "Manual renewal", autodelete: "Delete at expiry" }[String(mode || "").toLowerCase()] || "Sync pending");
+
+  return <div className="space-y-6">
+    <PageHeading title="Renewals" description="Check validity, get the latest price and renew using SellersLogin credits." action={<Button variant="outline" onClick={renewals.reload}><RefreshCcw />Refresh</Button>} />
+    {(error || renewals.error) && <ErrorState message={error || renewals.error} retry={renewals.reload} />}
+    {message && <div className="rounded-lg border border-primary/40 bg-primary/10 p-4 text-sm">{message}</div>}
+    <section className="grid gap-4 sm:grid-cols-3">
+      <Card><CardHeader><CardDescription>Available credits</CardDescription><CardTitle>{renewals.data ? formatDomainAmount(renewals.data.wallet.availableCredits, renewals.data.wallet.currency) : "—"}</CardTitle></CardHeader></Card>
+      <Card><CardHeader><CardDescription>Reserved credits</CardDescription><CardTitle>{renewals.data ? formatDomainAmount(renewals.data.wallet.reservedCredits, renewals.data.wallet.currency) : "—"}</CardTitle></CardHeader></Card>
+      <Card><CardHeader><CardDescription>Domains tracked</CardDescription><CardTitle>{renewals.data?.total ?? "—"}</CardTitle></CardHeader></Card>
+    </section>
+    {renewals.loading ? <Card><CardContent><LoadingState /></CardContent></Card> : renewals.data?.items.length ? <div className="grid gap-4">
+      {renewals.data.items.map((item) => <Card key={item.domainName} className={selected?.domainName === item.domainName ? "border-primary/50" : ""}><CardContent className="grid gap-4 py-5 lg:grid-cols-[1.4fr_1fr_auto] lg:items-center">
+        <div><div className="flex flex-wrap items-center gap-2"><p className="font-semibold">{item.unicodeDomainName || item.domainName}</p><Badge variant={item.lifecycle.stage === "ACTIVE" ? "secondary" : "outline"}>{stageLabel(item)}</Badge>{item.pendingOrder && <Badge variant="outline">{item.pendingOrder.status.replaceAll("_", " ")}</Badge>}</div><p className="mt-1 text-sm text-muted-foreground">{item.expirationDate ? `Valid until ${formatDomainDate(item.expirationDate)}` : "Expiry date unavailable"}</p>{item.statusReason && item.statusReason !== "None" && <p className="mt-1 text-xs text-muted-foreground">{item.statusReason}</p>}</div>
+        <div className="text-sm"><p>Renewal mode: <span className="font-medium">{renewalModeLabel(item.renewalMode)}</span></p>{item.providerAutoRenewRisk && <p className="mt-1 text-xs text-destructive">Automatic renewal is currently enabled for this domain. Please raise a live support ticket if you want manual renewal only.</p>}{item.lifecycle.stage === "REDEMPTION" && <p className="mt-1 text-xs text-destructive">Normal renewal is unavailable. A higher registry recovery fee applies.</p>}{item.lifecycle.stage === "PENDING_DELETE" && <p className="mt-1 text-xs text-destructive">The registry recovery window has closed.</p>}</div>
+        <Button variant={item.lifecycle.canRestore ? "destructive" : "default"} disabled={Boolean(item.pendingOrder) || (!item.lifecycle.canRenew && !item.lifecycle.canRestore)} onClick={() => selectDomain(item)}>{item.pendingOrder ? "Order in progress" : item.lifecycle.canRestore ? "Recover Domain" : item.lifecycle.canRenew ? "Renew Domain" : "Unavailable"}</Button>
+      </CardContent></Card>)}
+    </div> : <EmptyState title="No domains to renew" description="Purchased or transferred domains will appear here." action={<Button asChild><Link href="/search">Buy a domain</Link></Button>} />}
+    {selected && <Card><CardHeader><CardTitle>{action === "RESTORE" ? "Domain recovery quote" : "Renewal quote"}</CardTitle><CardDescription>{selected.domainName} · Latest provider-based price with the current SellersLogin pricing rule.</CardDescription></CardHeader><CardContent className="space-y-4">
+      {action === "RENEW" && <div className="max-w-xs space-y-2"><Label htmlFor="renewal-period">Renewal period</Label><select id="renewal-period" className="h-9 w-full rounded-md border bg-transparent px-3 text-sm" value={period} onChange={(event) => { setPeriod(Number(event.target.value)); setQuote(null); }}>{(selected.renewalPeriods.length ? selected.renewalPeriods : [1]).map((year) => <option key={year} value={year}>{year} {year === 1 ? "year" : "years"}</option>)}</select></div>}
+      {!quote ? <Button disabled={pending} onClick={getQuote}>{pending ? <LoaderCircle className="animate-spin" /> : <RefreshCcw />}Get Latest Price</Button> : <div className="flex flex-col gap-4 rounded-lg border p-4 sm:flex-row sm:items-center sm:justify-between"><div><p className="text-sm text-muted-foreground">Total payable</p><p className="text-2xl font-semibold">{formatDomainAmount(quote.pricing.customerAmount, quote.pricing.customerCurrency)}</p><p className="text-xs text-muted-foreground">{action === "RESTORE" ? "Registry recovery charge" : `${quote.period}-year renewal`} · Quote expires {formatDomainDate(quote.expiresAt)}</p>{renewals.data && renewals.data.wallet.availableCredits < quote.pricing.customerAmount && <p className="mt-2 text-xs text-destructive">Insufficient credits. Add credits from the main dashboard before confirming.</p>}</div><Button disabled={pending} onClick={confirm}>{pending ? <LoaderCircle className="animate-spin" /> : <CreditCard />}Confirm {action === "RESTORE" ? "Recovery" : "Renewal"}</Button></div>}
+    </CardContent></Card>}
+  </div>;
 }
 
 export function DnsRecords({ token, domainName }: { token: string; domainName?: string }) {
