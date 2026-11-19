@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowRight,
   CheckCircle2,
@@ -23,6 +23,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { createIdempotencyKey, domainApi, domainNdjsonStream, DomainApiError, formatDomainAmount, formatDomainDate } from "@/lib/domain-api";
+import { useDomainResource } from "@/lib/domain-resource";
 import { boundedSearchSignal, domainSearchRank, isCurrentDomainSearch, isSuggestionCheckFailed, isVerifiedAvailable, shouldStartDomainSearch } from "@/lib/domain-search-state";
 
 type PageResult<T> = { items: T[]; total: number; page: number; limit: number; pages: number };
@@ -50,6 +51,7 @@ type DomainOrder = {
 type Wallet = { availableCredits: number; reservedCredits: number; usedCredits: number; currency: string };
 type SearchResult = {
   domainName: string;
+  tld?: string;
   unicodeDomainName?: string;
   status: string;
   liveVerified?: boolean;
@@ -67,6 +69,22 @@ type SearchResult = {
   renewalPricingStatus?: "NOT_APPLICABLE" | "NOT_LOADED" | "LOADING" | "READY" | "UNKNOWN";
   promotion?: { campaignId: string; name: string; firstYearPrice: number; additionalYearPrice: number; requiredYears: number; bundleSubtotal: number; currency: string } | null;
   metrics?: { upstreamCallCount?: number; cacheHit?: boolean; totalMs?: number };
+};
+type CatalogueAttribute = {
+  name?: string;
+  key?: string;
+  label?: string;
+  description?: string;
+  required?: boolean;
+  isRequired?: boolean;
+  type?: string;
+  values?: Array<string | { value?: string; label?: string; name?: string }>;
+  options?: Array<string | { value?: string; label?: string; name?: string }>;
+};
+type TldCheckoutInfo = {
+  registrationPeriods: number[];
+  attributes?: CatalogueAttribute[];
+  capabilities?: { supportsTrustee?: boolean; requiresTrustee?: boolean; mayRequireDocument?: boolean };
 };
 type PrimarySearchResponse = { exactDomain: string; result: SearchResult };
 type SmartStreamEvent =
@@ -180,23 +198,13 @@ function DnsWorkspacePreview() {
 }
 
 function useResource<T>(token: string, path: string) {
-  const [data, setData] = useState<T | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
-  const [version, setVersion] = useState(0);
-  const reload = useCallback(() => setVersion((value) => value + 1), []);
-  useEffect(() => {
-    let active = true;
-    setLoading(true); setError("");
-    domainApi<T>(token, path).then((value) => { if (active) setData(value); }).catch((cause) => { if (active) setError(cause instanceof Error ? cause.message : "Request failed."); }).finally(() => { if (active) setLoading(false); });
-    return () => { active = false; };
-  }, [token, path, version]);
-  return { data, loading, error, reload };
+  return useDomainResource<T>(token, path);
 }
 
 export function VendorOverview({ token }: { token: string }) {
   const [wallet, setWallet] = useState<Wallet | null>(null);
   const [domains, setDomains] = useState<PageResult<DomainAsset> | null>(null);
+  const [stats, setStats] = useState<{ total: number; active: number; expiringSoon: number; expired: number; providerAutoRenew: number; actionRequired: number } | null>(null);
   const [orders, setOrders] = useState<PageResult<DomainOrder> | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -205,27 +213,26 @@ export function VendorOverview({ token }: { token: string }) {
     let active = true; setLoading(true); setError("");
     Promise.allSettled([
       domainApi<Wallet>(token, "/v1/domain/wallet"),
-      domainApi<PageResult<DomainAsset>>(token, "/v1/domain/domains?page=1&limit=100"),
+      domainApi<PageResult<DomainAsset>>(token, "/v1/domain/domains?page=1&limit=5"),
       domainApi<PageResult<DomainOrder>>(token, "/v1/domain/orders?page=1&limit=5"),
-    ]).then(([walletResult, domainResult, orderResult]) => {
+      domainApi<{ total: number; active: number; expiringSoon: number; expired: number; providerAutoRenew: number; actionRequired: number }>(token, "/v1/domain/dashboard"),
+    ]).then(([walletResult, domainResult, orderResult, statsResult]) => {
       if (!active) return;
       if (walletResult.status === "fulfilled") setWallet(walletResult.value);
       if (domainResult.status === "fulfilled") setDomains(domainResult.value);
       if (orderResult.status === "fulfilled") setOrders(orderResult.value);
-      if ([walletResult, domainResult, orderResult].every((result) => result.status === "rejected")) {
+      if (statsResult.status === "fulfilled") setStats(statsResult.value);
+      if ([walletResult, domainResult, orderResult, statsResult].every((result) => result.status === "rejected")) {
         setError("Live dashboard information is temporarily unavailable.");
       }
     }).finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
   }, [token, version]);
   const items = domains?.items || [];
-  const now = Date.now();
-  const expiringSoon = items.filter((item) => { const expiry = new Date(item.expirationDate || 0).getTime(); return expiry >= now && expiry <= now + 60 * 86400000; }).length;
-  const autoRenew = items.filter((item) => String(item.renewalMode).toLowerCase() === "autorenew").length;
   const cards = [
-    { label: "Owned domains", value: domains?.total, description: "Domains in your account", icon: Globe2 },
-    { label: "Expiring soon", value: expiringSoon, description: "Within the next 60 days", icon: Clock3 },
-    { label: "Automatic renewal", value: autoRenew, description: "Domains currently set to auto-renew", icon: RefreshCcw },
+    { label: "Owned domains", value: stats?.total, description: "Domains in your account", icon: Globe2 },
+    { label: "Expiring soon", value: stats?.expiringSoon, description: "Within the next 60 days", icon: Clock3 },
+    { label: "Need attention", value: stats?.actionRequired, description: "Domains waiting for an action", icon: RefreshCcw },
     { label: "Wallet balance", value: wallet ? `${wallet.availableCredits.toLocaleString("en-IN")} ${wallet.currency}` : null, description: wallet ? `${wallet.reservedCredits.toLocaleString("en-IN")} reserved` : "Available credits", icon: WalletCards },
   ];
   return <div className="space-y-6">
@@ -425,9 +432,59 @@ function CompactSuggestionRows({ suggestions, selectedDomain, checkoutReady, pen
   })}</div>;
 }
 
+const contactLabels: Record<string, string> = {
+  firstName: "First name",
+  lastName: "Last name",
+  companyName: "Company name (optional)",
+  eMail: "Email address",
+  address: "Street address",
+  city: "City",
+  state: "State or province",
+  postalCode: "Postal code",
+  country: "Country code",
+  phoneCountryCode: "Phone country code",
+  phone: "Phone number",
+};
+
+const attributeName = (attribute: CatalogueAttribute) => String(attribute.name || attribute.key || "").trim();
+const attributeLabel = (attribute: CatalogueAttribute) => String(attribute.label || attribute.description || attributeName(attribute)).trim();
+const attributeOptions = (attribute: CatalogueAttribute) => attribute.options || attribute.values || [];
+
+function RegistrationCheckoutFields({ catalogue, result, quote, contact, pending, attributes, onContact, onAttributes, onPeriod }: {
+  catalogue: TldCheckoutInfo | null;
+  result: SearchResult;
+  quote: Quote;
+  contact: typeof emptyContact;
+  pending: boolean;
+  attributes: Record<string, string | number | boolean>;
+  onContact: (value: typeof emptyContact) => void;
+  onAttributes: (value: Record<string, string | number | boolean>) => void;
+  onPeriod: (period: number) => void;
+}) {
+  const periods = result.isPremium
+    ? [1]
+    : Array.from(new Set((catalogue?.registrationPeriods?.length ? catalogue.registrationPeriods : [quote.period]).map(Number).filter((value) => Number.isInteger(value) && value >= 1 && value <= 10))).sort((a, b) => a - b);
+  const visibleAttributes = (catalogue?.attributes || []).filter((attribute) => attributeName(attribute));
+  const requiresTrustee = Boolean(catalogue?.capabilities?.requiresTrustee);
+  return <>
+    <div className="rounded-lg border bg-muted/20 p-4 sm:col-span-2">
+      <Label htmlFor="registration-period">Registration period</Label>
+      <select id="registration-period" className="mt-2 h-9 w-full max-w-xs rounded-md border bg-background px-3 text-sm" value={quote.period} disabled={pending || Boolean(quote.pricing.campaign) || result.isPremium} onChange={(event) => onPeriod(Number(event.target.value))}>
+        {periods.map((value) => <option key={value} value={value}>{value} {value === 1 ? "year" : "years"}</option>)}
+      </select>
+      {result.isPremium && <p className="mt-2 text-xs text-muted-foreground">This premium domain can be registered for one year at a time.</p>}
+      {quote.pricing.campaign && <p className="mt-2 text-xs text-muted-foreground">This offer uses a fixed {quote.period}-year registration period.</p>}
+    </div>
+    {Object.entries(contact).map(([key, value]) => <div key={key} className="space-y-2"><Label htmlFor={key}>{contactLabels[key] || key}</Label><Input id={key} type={key === "eMail" ? "email" : "text"} value={value} required={key !== "companyName"} placeholder={key === "country" ? "IN" : key === "phoneCountryCode" ? "91" : undefined} onChange={(event) => onContact({ ...contact, [key]: event.target.value })} /></div>)}
+    {visibleAttributes.length > 0 && <div className="space-y-4 rounded-lg border p-4 sm:col-span-2"><div><p className="font-medium">Additional domain details</p><p className="text-sm text-muted-foreground">This domain ending needs a few extra details before it can be registered.</p></div><div className="grid gap-4 sm:grid-cols-2">{visibleAttributes.map((attribute) => { const name = attributeName(attribute); const options = attributeOptions(attribute); const required = Boolean(attribute.required || attribute.isRequired); return <div key={name} className="space-y-2"><Label htmlFor={`attribute-${name}`}>{attributeLabel(attribute)}{required ? " *" : ""}</Label>{options.length ? <select id={`attribute-${name}`} className="h-9 w-full rounded-md border bg-background px-3 text-sm" required={required} value={String(attributes[name] ?? "")} onChange={(event) => onAttributes({ ...attributes, [name]: event.target.value })}><option value="">Select an option</option>{options.map((option) => { const value = typeof option === "string" ? option : String(option.value || option.name || ""); const label = typeof option === "string" ? option : String(option.label || option.name || option.value || ""); return <option key={value} value={value}>{label}</option>; })}</select> : <Input id={`attribute-${name}`} required={required} value={String(attributes[name] ?? "")} onChange={(event) => onAttributes({ ...attributes, [name]: event.target.value })} />}</div>; })}</div></div>}
+    {(result.isDocumentRequired || catalogue?.capabilities?.mayRequireDocument) && <div className="rounded-lg border border-amber-300 bg-amber-50 p-4 text-sm text-amber-950 sm:col-span-2"><p className="font-medium">Verification documents may be needed</p><p className="mt-1">After the purchase, open Documents &amp; Verification and upload the requested files. The domain becomes active after the review is completed.</p></div>}
+    {requiresTrustee && <div className="rounded-lg border border-amber-300 bg-amber-50 p-4 text-sm text-amber-950 sm:col-span-2"><p className="font-medium">Local contact service is required</p><p className="mt-1">Please raise a support ticket before purchasing this domain so the exact total can be confirmed.</p></div>}
+  </>;
+}
+
 export function SearchAndBuy({ token }: { token: string }) {
   const [query, setQuery] = useState(""); const [suggestions, setSuggestions] = useState<SearchResult[]>([]); const [result, setResult] = useState<SearchResult | null>(null); const [quote, setQuote] = useState<Quote | null>(null);
-  const [contact, setContact] = useState(emptyContact); const [searching, setSearching] = useState(false); const [submittedQuery, setSubmittedQuery] = useState(""); const [searchError, setSearchError] = useState(""); const [pending, setPending] = useState(false); const [error, setError] = useState(""); const [order, setOrder] = useState<DomainOrder | null>(null);
+  const [contact, setContact] = useState(emptyContact); const [registrationAttributes, setRegistrationAttributes] = useState<Record<string, string | number | boolean>>({}); const [searching, setSearching] = useState(false); const [submittedQuery, setSubmittedQuery] = useState(""); const [searchError, setSearchError] = useState(""); const [pending, setPending] = useState(false); const [error, setError] = useState(""); const [order, setOrder] = useState<DomainOrder | null>(null);
   const [alternativeDomain, setAlternativeDomain] = useState("");
   const [hasMoreSuggestions, setHasMoreSuggestions] = useState(false);
   const [nextSuggestionOffset, setNextSuggestionOffset] = useState(0);
@@ -435,6 +492,8 @@ export function SearchAndBuy({ token }: { token: string }) {
   const [searchMetrics, setSearchMetrics] = useState<{ exactMs?: number; firstAlternativeMs?: number; firstSuggestionMs?: number; firstFiveMs?: number; upstreamCallCount: number; errorCount: number }>({ upstreamCallCount: 0, errorCount: 0 });
   const [purchaseKey, setPurchaseKey] = useState("");
   const [purchaseToast, setPurchaseToast] = useState<{ title: string; message: string } | null>(null);
+  const selectedTld = result ? result.tld || result.domainName.split(".").slice(-1)[0] : "";
+  const checkoutCatalogue = useDomainResource<TldCheckoutInfo>(token, selectedTld ? `/v1/domain/catalogue/${encodeURIComponent(selectedTld)}` : "", 60_000);
   const latestSearchId = useRef(0);
   const activeSearch = useRef<{ query: string; controller: AbortController; pending: boolean } | null>(null);
   const renewalRequests = useRef(new Set<string>());
@@ -523,11 +582,11 @@ export function SearchAndBuy({ token }: { token: string }) {
           }
         },
       );
-    } catch (cause) {
+    } catch {
       if (!isCurrent()) return;
       setSuggestions((current) => markDomainsUnverified(current, pageDomains));
       setSearchMetrics((current) => ({ ...current, errorCount: current.errorCount + Math.max(pageDomains.length, 1) }));
-      setSearchError(cause instanceof Error ? `Some suggestions could not be checked: ${cause.message}` : "Some suggestions could not be checked.");
+      setSearchError("Some suggestions could not be checked. Please try again.");
     } finally {
       if (isCurrent() && !initial) setLoadingMoreSuggestions(false);
     }
@@ -629,7 +688,7 @@ export function SearchAndBuy({ token }: { token: string }) {
     }
   };
   const createQuote = async (selected: SearchResult) => {
-    setResult(selected); setQuote(null); setOrder(null); setPurchaseKey(""); setPending(true); setError("");
+    setResult(selected); setQuote(null); setOrder(null); setPurchaseKey(""); setRegistrationAttributes({}); setPending(true); setError("");
     try {
       const quoteRequest = (usePromotion: boolean) => domainApi<Quote>(token, "/v1/domain/quotes/registration", {
         method: "POST",
@@ -665,7 +724,23 @@ export function SearchAndBuy({ token }: { token: string }) {
       setPending(false);
     }
   };
-  const purchase = async (event: FormEvent) => { event.preventDefault(); if (!quote || !purchaseKey) return; setError(""); setPurchaseToast(null); setPending(true); try { const currentWallet = await domainApi<Wallet>(token, "/v1/domain/wallet"); if (currentWallet.availableCredits < quote.pricing.customerAmount) { const shortfall = quote.pricing.customerAmount - currentWallet.availableCredits; setPurchaseToast({ title: "Insufficient credits", message: `Please add ${formatDomainAmount(shortfall, quote.pricing.customerCurrency)} more credits to purchase this domain.` }); return; } const contacts = ["Registrant", "Admin", "Tech", "Billing"].map((contactType) => ({ ...contact, contactType })); const value = await domainApi<DomainOrder>(token, "/v1/domain/purchases/registration", { method: "POST", headers: { "Idempotency-Key": purchaseKey }, body: JSON.stringify({ quoteId: quote.quoteId, contacts, tldAttributes: {}, useTrusteeContact: false }) }); setOrder(value); } catch (cause) { const message = cause instanceof Error ? cause.message : "Registration failed."; const code = cause instanceof DomainApiError ? cause.code : ""; setPurchaseToast({ title: code === "INSUFFICIENT_DOMAIN_CREDITS" ? "Insufficient credits" : code === "DOMAIN_NAMESERVERS_NOT_CONFIGURED" ? "Domain purchase unavailable" : "Purchase could not be completed", message }); } finally { setPending(false); } };
+  const changeRegistrationPeriod = async (period: number) => {
+    if (!result || period === quote?.period) return;
+    setPending(true); setError("");
+    try {
+      const nextQuote = await domainApi<Quote>(token, "/v1/domain/quotes/registration", {
+        method: "POST",
+        body: JSON.stringify({ domainName: result.domainName, period }),
+      });
+      setQuote(nextQuote);
+      setPurchaseKey(createIdempotencyKey("domain-register"));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "The price for this period could not be loaded.");
+    } finally {
+      setPending(false);
+    }
+  };
+  const purchase = async (event: FormEvent) => { event.preventDefault(); if (!quote || !purchaseKey) return; if (checkoutCatalogue.data?.capabilities?.requiresTrustee) { setPurchaseToast({ title: "Support confirmation required", message: "Please raise a support ticket so the exact local contact service total can be confirmed before purchase." }); return; } setError(""); setPurchaseToast(null); setPending(true); try { const currentWallet = await domainApi<Wallet>(token, "/v1/domain/wallet"); if (currentWallet.availableCredits < quote.pricing.customerAmount) { const shortfall = quote.pricing.customerAmount - currentWallet.availableCredits; setPurchaseToast({ title: "Insufficient credits", message: `Please add ${formatDomainAmount(shortfall, quote.pricing.customerCurrency)} more credits to purchase this domain.` }); return; } const contacts = ["Registrant", "Admin", "Tech", "Billing"].map((contactType) => ({ ...contact, contactType })); const value = await domainApi<DomainOrder>(token, "/v1/domain/purchases/registration", { method: "POST", headers: { "Idempotency-Key": purchaseKey }, body: JSON.stringify({ quoteId: quote.quoteId, contacts, tldAttributes: registrationAttributes, useTrusteeContact: false }) }); setOrder(value); } catch (cause) { const message = cause instanceof Error ? cause.message : "The domain purchase could not be completed."; const code = cause instanceof DomainApiError ? cause.code : ""; setPurchaseToast({ title: code === "INSUFFICIENT_DOMAIN_CREDITS" ? "Insufficient credits" : code === "DOMAIN_NAMESERVERS_NOT_CONFIGURED" ? "Domain purchase unavailable" : "Purchase could not be completed", message }); } finally { setPending(false); } };
   const exactSuggestion = suggestions.find((item) => (item.badges || []).includes("EXACT_MATCH"));
   const alternativeSuggestion = suggestions.find((item) => item.domainName === alternativeDomain && isVerifiedAvailable(item));
   const compactSuggestions = suggestions.filter((item) => !(item.badges || []).includes("EXACT_MATCH") && item.domainName !== alternativeDomain);
@@ -689,8 +764,8 @@ export function SearchAndBuy({ token }: { token: string }) {
         </div>
       </Card>
     </section>}
-    {quote && !order && <Card id="domain-checkout-form"><CardHeader><CardTitle>Registrant details</CardTitle><CardDescription>Complete the details for {quote.domainName}. SellersLogin configures DNS automatically, and nameservers can be changed after purchase.</CardDescription></CardHeader><CardContent><form className="grid gap-4 sm:grid-cols-2" onSubmit={purchase}>{Object.entries(contact).map(([key, value]) => <div key={key} className="space-y-2"><Label htmlFor={key}>{key.replace(/([A-Z])/g, " $1").replace(/^./, (letter) => letter.toUpperCase())}</Label><Input id={key} type={key === "eMail" ? "email" : "text"} value={value} required={key !== "companyName"} onChange={(event) => setContact((current) => ({ ...current, [key]: event.target.value }))} /></div>)}<div className="rounded-md border bg-muted/30 p-4 sm:col-span-2">{quote.pricing.campaign && <div className="mb-3 space-y-1 text-sm"><div className="flex justify-between"><span>First year promotional price</span><span>{formatDomainAmount(quote.pricing.campaign.firstYearPrice, quote.pricing.customerCurrency)}</span></div><div className="flex justify-between"><span>Additional {quote.pricing.campaign.requiredYears - 1} years</span><span>{formatDomainAmount(quote.pricing.campaign.additionalYearPrice * (quote.pricing.campaign.requiredYears - 1), quote.pricing.customerCurrency)}</span></div></div>}<div className="flex items-center justify-between border-t pt-3"><div><p className="font-medium">Total: {formatDomainAmount(quote.pricing.customerAmount, quote.pricing.customerCurrency)}</p><p className="text-xs text-muted-foreground">{quote.period}-year term · Paid from SellersLogin credits · Quote expires {formatDomainDate(quote.expiresAt)}</p></div><Button disabled={pending}>{pending ? <LoaderCircle className="animate-spin" /> : <CreditCard />}Confirm purchase</Button></div></div></form></CardContent></Card>}
-    {order && <Card className="border-primary"><CardContent className="flex items-start gap-3 py-6"><CheckCircle2 className="size-5 text-primary" /><div><p className="font-medium">Order {order.status.replaceAll("_", " ")}</p><p className="text-sm text-muted-foreground">Order ID: {order.orderId}</p></div></CardContent></Card>}
+    {quote && result && !order && <Card id="domain-checkout-form"><CardHeader><CardTitle>Registration details</CardTitle><CardDescription>Complete the owner details for {quote.domainName}. You can change nameservers after purchase.</CardDescription></CardHeader><CardContent><form className="grid gap-4 sm:grid-cols-2" onSubmit={purchase}><RegistrationCheckoutFields catalogue={checkoutCatalogue.data} result={result} quote={quote} contact={contact} pending={pending} attributes={registrationAttributes} onContact={setContact} onAttributes={setRegistrationAttributes} onPeriod={(value) => void changeRegistrationPeriod(value)} />{checkoutCatalogue.error && <div className="sm:col-span-2"><ErrorState message="Some registration requirements could not be loaded. Please try again before purchasing." retry={checkoutCatalogue.reload} /></div>}<div className="rounded-md border bg-muted/30 p-4 sm:col-span-2">{quote.pricing.campaign && <div className="mb-3 space-y-1 text-sm"><div className="flex justify-between"><span>First year promotional price</span><span>{formatDomainAmount(quote.pricing.campaign.firstYearPrice, quote.pricing.customerCurrency)}</span></div><div className="flex justify-between"><span>Additional {quote.pricing.campaign.requiredYears - 1} years</span><span>{formatDomainAmount(quote.pricing.campaign.additionalYearPrice * (quote.pricing.campaign.requiredYears - 1), quote.pricing.customerCurrency)}</span></div></div>}<div className="flex flex-col justify-between gap-3 border-t pt-3 sm:flex-row sm:items-center"><div><p className="font-medium">Total: {formatDomainAmount(quote.pricing.customerAmount, quote.pricing.customerCurrency)}</p><p className="text-xs text-muted-foreground">{quote.period}-year term · Paid from SellersLogin credits · Price available until {formatDomainDate(quote.expiresAt)}</p></div><Button disabled={pending || checkoutCatalogue.loading || Boolean(checkoutCatalogue.error) || Boolean(checkoutCatalogue.data?.capabilities?.requiresTrustee)}>{pending || checkoutCatalogue.loading ? <LoaderCircle className="animate-spin" /> : <CreditCard />}Confirm Purchase</Button></div></div></form></CardContent></Card>}
+    {order && <Card className="border-primary"><CardContent className="flex flex-col justify-between gap-4 py-6 sm:flex-row sm:items-center"><div className="flex items-start gap-3"><CheckCircle2 className="size-5 text-primary" /><div><p className="font-medium">{order.status === "COMPLETED" ? "Your domain purchase is complete" : "Your domain order is being processed"}</p><p className="mt-1 text-sm text-muted-foreground">Order reference: {order.orderId}</p>{result?.isDocumentRequired && <p className="mt-1 text-sm text-amber-700">Upload the requested verification files to complete the registration.</p>}</div></div><div className="flex flex-wrap gap-2"><Button asChild variant="outline"><Link href={`/orders/${encodeURIComponent(order.orderId)}`}>View Order</Link></Button>{result?.isDocumentRequired && <Button asChild><Link href="/documents">Upload Documents</Link></Button>}</div></CardContent></Card>}
   </div>;
 }
 

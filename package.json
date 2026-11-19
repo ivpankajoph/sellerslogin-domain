@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test:domain-search": "node --test lib/domain-search-state.test.ts"
+    "test:domain-search": "node --test lib/*.test.ts"
   },
   "dependencies": {
     "@radix-ui/react-dropdown-menu": "^2.2.1",

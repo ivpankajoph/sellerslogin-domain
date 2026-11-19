@@ -16,10 +16,22 @@ export class DomainApiError extends Error {
   }
 }
 
-const sellersLoginErrorMessage = (value: unknown, fallback: string) => {
+const friendlyErrorByCode: Record<string, string> = {
+  INSUFFICIENT_DOMAIN_CREDITS: "You do not have enough credits for this action. Add credits and try again.",
+  DOMAIN_NOT_FOUND: "This domain is not available in your account.",
+  DOMAIN_CONTACT_NOT_FOUND: "This contact is not linked to the selected domain.",
+  DOMAIN_NOTIFICATION_NOT_FOUND: "This notification is no longer available.",
+  DOMAIN_SERVICE_UNREACHABLE: "The domain service is temporarily unavailable. Please try again shortly.",
+};
+
+const technicalText = /(domainnameapi|domainresellerapi|currencyapi|upstream|provider|http\s*\d{3}|status\s*code|stack|exception|mongodb|mongoose|axios|econn|etimedout|socket|database|internal server|dna\.|validationerror|unauthorized!|correlation|request id|json|undefined|null)/i;
+
+export const sellersLoginErrorMessage = (value: unknown, fallback: string, code = "") => {
+  if (friendlyErrorByCode[code]) return friendlyErrorByCode[code];
   const message = String(value || "").trim();
   if (!message) return fallback;
-  if (/domainnameapi|domainresellerapi|currencyapi|upstream|provider/i.test(message)) return fallback;
+  if (technicalText.test(message)) return fallback;
+  if (message.length > 220) return fallback;
   return message;
 };
 
@@ -58,7 +70,7 @@ export async function domainApi<T>(
       ? "Your session has expired. Please sign in again."
       : "This SellersLogin domain request could not be completed. Please try again.";
     throw new DomainApiError(
-      sellersLoginErrorMessage(payload?.message || payload?.error, fallback),
+      sellersLoginErrorMessage(payload?.message || payload?.error, fallback, String(payload?.code || "")),
       response.status,
       payload?.code,
     );
@@ -93,7 +105,7 @@ export async function domainNdjsonStream<T>(
   if (!response.ok || !response.body) {
     const payload = await response.json().catch(() => ({}));
     throw new DomainApiError(
-      sellersLoginErrorMessage(payload?.message || payload?.error, "Suggestions could not be checked."),
+      sellersLoginErrorMessage(payload?.message || payload?.error, "Suggestions could not be checked.", String(payload?.code || "")),
       response.status,
       payload?.code,
     );

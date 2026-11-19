@@ -12,6 +12,7 @@ import {
   ChevronDown,
   CircleCheck,
   Clock3,
+  Database,
   Globe2,
   LayoutDashboard,
   LogOut,
@@ -57,6 +58,12 @@ type ProviderStatus = {
   environment?: string;
   currencyCompatible?: boolean;
   resellerAutoRenewSafetyAcknowledged?: boolean;
+  balance?: { usdBalance?: number } | null;
+  latestStoredBalance?: { usdBalance?: number; checkedAt?: string } | null;
+  lowBalanceThresholdUsd?: number;
+  pendingFinancialConfirmations?: number;
+  financialReviewCount?: number;
+  unreadAdminNotifications?: number;
 };
 
 type DashboardData = {
@@ -68,6 +75,8 @@ type DomainOrder = {
   orderId: string;
   domainName: string;
   vendorId: string;
+  vendorName?: string;
+  vendorEmail?: string;
   operation: string;
   amount: number;
   currency: string;
@@ -80,8 +89,25 @@ const adminNavigation = [
   { label: "Domains", href: "/admin/domains", icon: Globe2 },
   { label: "Orders", href: "/admin/orders", icon: ShoppingCart },
   { label: "Pricing", href: "/admin/pricing", icon: Tags },
+  { label: "Operations", href: "/admin/operations/catalogue", icon: Database },
   { label: "Reports", href: "/admin/reports", icon: ChartNoAxesCombined },
   { label: "Settings", href: "/admin/settings", icon: Settings },
+];
+
+const operationsNavigation = [
+  { label: "Domain catalogue", href: "/admin/operations/catalogue" },
+  { label: "Credit activity", href: "/admin/operations/wallet-ledger" },
+  { label: "Search activity", href: "/admin/operations/search-activity" },
+  { label: "Audit log", href: "/admin/operations/audit-logs" },
+];
+
+const reportsNavigation = [
+  { label: "Report summary", href: "/admin/reports" },
+  { label: "Sales & profit", href: "/admin/reports/sales-profit" },
+  { label: "Domain performance", href: "/admin/reports/domain-performance" },
+  { label: "Vendor performance", href: "/admin/reports/vendor-performance" },
+  { label: "Provider charges", href: "/admin/reports/provider-charges" },
+  { label: "Failed & pending orders", href: "/admin/reports/order-issues" },
 ];
 
 const pricingNavigation = [
@@ -102,10 +128,18 @@ export function SuperAdminDashboard({
 }: SuperAdminDashboardProps) {
   const pathname = usePathname();
   const pricingPathActive = pathname.startsWith("/admin/pricing");
-  const activeItem = (pricingPathActive ? "Pricing" : adminNavigation.find((item) => item.href === pathname)?.label)
+  const operationsPathActive = pathname.startsWith("/admin/operations");
+  const reportsPathActive = pathname.startsWith("/admin/reports");
+  const activeItem = pathname === "/admin/notifications" ? "Notifications"
+    : pricingPathActive ? "Pricing"
+      : operationsPathActive ? "Operations"
+        : adminNavigation.find((item) => item.href !== "/admin" && pathname.startsWith(item.href))?.label
+          || adminNavigation.find((item) => item.href === pathname)?.label
     || (pathname === "/" ? "Overview" : "Overview");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [pricingMenuOpen, setPricingMenuOpen] = useState(false);
+  const [operationsMenuOpen, setOperationsMenuOpen] = useState(false);
+  const [reportsMenuOpen, setReportsMenuOpen] = useState(false);
   const [dashboard, setDashboard] = useState<DashboardData | null>(null);
   const [recentOrders, setRecentOrders] = useState<DomainOrder[]>([]);
   const [pendingOrders, setPendingOrders] = useState<number | null>(null);
@@ -154,6 +188,16 @@ export function SuperAdminDashboard({
     };
   }, [token]);
 
+  useEffect(() => {
+    const updateUnread = (event: Event) => {
+      const unread = Number((event as CustomEvent<{ unread: number }>).detail?.unread);
+      if (!Number.isFinite(unread)) return;
+      setDashboard((current) => current ? { ...current, provider: { ...current.provider, unreadAdminNotifications: Math.max(0, unread) } } : current);
+    };
+    window.addEventListener("domain-admin-notifications-changed", updateUnread);
+    return () => window.removeEventListener("domain-admin-notifications-changed", updateUnread);
+  }, []);
+
   const summaryCards = useMemo(() => [
     { label: "Total domains", value: dashboard?.domains.total, description: "Across all vendor accounts", icon: Globe2 },
     { label: "Vendors", value: dashboard?.domains.vendors, description: "Using the domain service", icon: Building2 },
@@ -178,6 +222,17 @@ export function SuperAdminDashboard({
     }
     if (reconciliationOrders) {
       items.push({ title: "Orders require reconciliation", detail: `${reconciliationOrders} domain operation${reconciliationOrders === 1 ? "" : "s"} need admin review.`, icon: Activity, badge: String(reconciliationOrders) });
+    }
+    if (dashboard?.provider.pendingFinancialConfirmations) {
+      items.push({ title: "Provider charges awaiting confirmation", detail: `${dashboard.provider.pendingFinancialConfirmations} completed order${dashboard.provider.pendingFinancialConfirmations === 1 ? " is" : "s are"} waiting for a matching provider debit.`, icon: Clock3, badge: String(dashboard.provider.pendingFinancialConfirmations) });
+    }
+    if (dashboard?.provider.financialReviewCount) {
+      items.push({ title: "Provider charges need review", detail: `${dashboard.provider.financialReviewCount} charge record${dashboard.provider.financialReviewCount === 1 ? " has" : "s have"} a mismatch or could not be matched safely.`, icon: TriangleAlert, badge: String(dashboard.provider.financialReviewCount) });
+    }
+    const usdBalance = dashboard?.provider.balance?.usdBalance ?? dashboard?.provider.latestStoredBalance?.usdBalance;
+    const lowBalanceThreshold = dashboard?.provider.lowBalanceThresholdUsd;
+    if (usdBalance != null && lowBalanceThreshold != null && Number(usdBalance) < Number(lowBalanceThreshold)) {
+      items.push({ title: "Provider balance is low", detail: `The available provider balance is $${Number(usdBalance).toFixed(2)}. Add funds before paid domain operations are affected.`, icon: TriangleAlert, badge: "Low" });
     }
     return items;
   }, [dashboard, reconciliationOrders, loading, loadError]);
@@ -256,6 +311,20 @@ export function SuperAdminDashboard({
                   </Button>
                 ))}</div>}
               </div>
+            ) : item.label === "Operations" ? (
+              <div key={item.label}>
+                <Button type="button" variant={operationsPathActive ? "secondary" : "ghost"} className={cn("w-full justify-start", operationsPathActive && "bg-primary/20")} onClick={() => setOperationsMenuOpen((value) => !value)} aria-expanded={operationsMenuOpen || operationsPathActive}>
+                  <item.icon /><span className="flex-1 text-left">{item.label}</span><ChevronDown className={cn("transition-transform", (operationsMenuOpen || operationsPathActive) && "rotate-180")} />
+                </Button>
+                {(operationsMenuOpen || operationsPathActive) && <div className="mt-1 ml-4 space-y-1 border-l pl-4">{operationsNavigation.map((child) => <Button key={child.href} asChild variant={pathname === child.href ? "secondary" : "ghost"} size="sm" className={cn("w-full justify-start", pathname === child.href && "bg-primary/15")}><Link href={child.href} onClick={() => setSidebarOpen(false)}>{child.label}</Link></Button>)}</div>}
+              </div>
+            ) : item.label === "Reports" ? (
+              <div key={item.label}>
+                <Button type="button" variant={reportsPathActive ? "secondary" : "ghost"} className={cn("w-full justify-start", reportsPathActive && "bg-primary/20")} onClick={() => setReportsMenuOpen((value) => !value)} aria-expanded={reportsMenuOpen || reportsPathActive}>
+                  <item.icon /><span className="flex-1 text-left">{item.label}</span><ChevronDown className={cn("transition-transform", (reportsMenuOpen || reportsPathActive) && "rotate-180")} />
+                </Button>
+                {(reportsMenuOpen || reportsPathActive) && <div className="mt-1 ml-4 space-y-1 border-l pl-4">{reportsNavigation.map((child) => <Button key={child.href} asChild variant={pathname === child.href ? "secondary" : "ghost"} size="sm" className={cn("w-full justify-start", pathname === child.href && "bg-primary/15")}><Link href={child.href} onClick={() => setSidebarOpen(false)}>{child.label}</Link></Button>)}</div>}
+              </div>
             ) : (
               <Button
                 key={item.label}
@@ -307,7 +376,7 @@ export function SuperAdminDashboard({
             <Button variant="ghost" size="icon" onClick={onToggleTheme}>
               {darkMode ? <Sun /> : <Moon />}
             </Button>
-            <Button variant="ghost" size="icon"><Bell /></Button>
+            <Button asChild variant="ghost" size="icon" className="relative"><Link href="/admin/notifications" aria-label="Domain notifications"><Bell />{dashboard?.provider.unreadAdminNotifications ? <span className="absolute right-1 top-1 flex size-4 items-center justify-center rounded-full bg-destructive text-[10px] text-destructive-foreground">{Math.min(dashboard.provider.unreadAdminNotifications, 9)}</span> : null}</Link></Button>
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <Button variant="ghost" className="gap-2">
@@ -377,7 +446,7 @@ export function SuperAdminDashboard({
                       {recentOrders.map((order) => (
                         <tr key={order.orderId} className="border-b last:border-0">
                           <td className="py-4 font-medium">{order.domainName}</td>
-                          <td className="py-4 text-muted-foreground">{order.vendorId}</td>
+                          <td className="py-4"><p className="font-medium">{order.vendorName || "Vendor"}</p><p className="text-xs text-muted-foreground">{order.vendorEmail || "Email not available"}</p></td>
                           <td className="py-4">{order.operation}</td>
                           <td className="py-4">{formatAmount(order)}</td>
                           <td className="py-4 text-right">
@@ -422,7 +491,7 @@ export function SuperAdminDashboard({
           </main>
         ) : (
           <main className="mx-auto max-w-7xl p-4 md:p-6">
-            <AdminSectionPage section={activeItem as "Vendors" | "Domains" | "Orders" | "Pricing" | "Reports" | "Settings"} token={token} />
+            <AdminSectionPage section={activeItem as "Vendors" | "Domains" | "Orders" | "Pricing" | "Reports" | "Settings" | "Operations" | "Notifications"} token={token} />
           </main>
         )}
       </div>
