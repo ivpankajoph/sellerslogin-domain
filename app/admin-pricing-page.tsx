@@ -6,6 +6,7 @@ import { AlertTriangle, ArrowLeft, ArrowRight, RefreshCcw, Search } from "lucide
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { useConfirmationDialog } from "@/components/ui/confirmation-dialog";
 import { domainApi, formatDomainAmount, formatDomainDate } from "@/lib/domain-api";
 
 type PageResult<T> = { items: T[]; total: number; page: number; pages: number };
@@ -40,10 +41,10 @@ function useMutation(token: string, reload: () => void) {
   const [pending, setPending] = useState(false);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
-  const mutate = async (path: string, method: "POST" | "PUT", body: unknown, message: string) => {
+  const mutate = async (path: string, method: "POST" | "PUT" | "DELETE", body: unknown, message: string) => {
     setPending(true); setError(""); setNotice("");
     try {
-      await domainApi(token, path, { method, body: JSON.stringify(body) });
+      await domainApi(token, path, { method, ...(method === "DELETE" ? {} : { body: JSON.stringify(body) }) });
       setNotice(message); reload();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Changes could not be saved.");
@@ -143,6 +144,7 @@ function DomainPrices({ token }: { token: string }) {
 }
 
 function SpecialPricingRules({ token }: { token: string }) {
+  const requestConfirmation = useConfirmationDialog();
   const policy = useResource<PricingPolicy>(token, "/v1/admin/domain/pricing");
   const mutation = useMutation(token, policy.reload);
   if (policy.loading || policy.error) return <LoadState loading={policy.loading} error={policy.error} retry={policy.reload} />;
@@ -156,6 +158,10 @@ function SpecialPricingRules({ token }: { token: string }) {
     const input = window.prompt("Profit amount", String(item.markupValue)); if (input == null) return;
     const markupValue = Number(input); if (!Number.isFinite(markupValue) || markupValue < 0) return;
     void mutation.mutate(`/v1/admin/domain/pricing/rules/${item.ruleId}`, "PUT", { name, tld: item.tld, operation: item.operation, markupType: item.markupType, markupValue, active: item.active, startsAt: item.startsAt || null, endsAt: item.endsAt || null }, "Special pricing rule updated successfully.");
+  };
+  const remove = async (item: PricingRule) => {
+    if (!await requestConfirmation({ title: "Delete this pricing rule?", description: `Permanently delete “${item.name}”? A rule that has already been used should be archived instead.`, confirmLabel: "Delete Rule", destructive: true })) return;
+    void mutation.mutate(`/v1/admin/domain/pricing/rules/${item.ruleId}`, "DELETE", null, "Special pricing rule deleted successfully.");
   };
   return <div className="space-y-6">
     <PageHeading title="Special pricing rules" description="Set a different profit amount for a specific domain type and purchase action." onRefresh={policy.reload} />
@@ -174,11 +180,12 @@ function SpecialPricingRules({ token }: { token: string }) {
       <Field label="Profit amount" help="Example: enter 3 for $3, or 10 for 10%."><Input name="markupValue" type="number" min="0" step="0.01" placeholder="Enter amount" required /></Field>
       <div className="flex items-end"><Button className="w-full" disabled={mutation.pending}>{mutation.pending ? "Saving..." : "Save special price"}</Button></div>
     </form></CardContent></Card>
-    <Card><CardHeader><CardTitle>Saved special pricing rules</CardTitle><CardDescription>Archived rules remain available and default pricing is used instead.</CardDescription></CardHeader><CardContent><div className="divide-y">{policy.data?.rules.map((item) => <div key={item.ruleId} className="flex flex-col gap-3 py-4 sm:flex-row sm:items-center sm:justify-between"><div><p className="font-medium">.{item.tld} · {item.operation === "REGISTER" ? "New registration" : item.operation === "RENEW" ? "Renewal" : item.operation === "RESTORE" ? "Recovery" : "Transfer"}</p><p className="text-sm text-muted-foreground">{item.name} · {item.markupType === "PERCENT" ? `${item.markupValue}% profit` : `${item.markupValue} ${item.markupType === "FIXED_CUSTOMER" ? "INR" : "USD"} profit`}</p></div><div className="flex gap-2"><Button type="button" size="sm" variant="outline" onClick={() => edit(item)} disabled={mutation.pending}>Edit</Button><Button type="button" size="sm" variant="outline" onClick={() => toggle(item)} disabled={mutation.pending}>{item.active ? "Archive" : "Enable"}</Button></div></div>)}{!policy.data?.rules.length && <p className="py-10 text-center text-sm text-muted-foreground">No special pricing rules have been created. Default pricing applies to every domain type.</p>}</div></CardContent></Card>
+    <Card><CardHeader><CardTitle>Saved special pricing rules</CardTitle><CardDescription>Archived rules remain available and default pricing is used instead.</CardDescription></CardHeader><CardContent><div className="divide-y">{policy.data?.rules.map((item) => <div key={item.ruleId} className="flex flex-col gap-3 py-4 sm:flex-row sm:items-center sm:justify-between"><div><p className="font-medium">.{item.tld} · {item.operation === "REGISTER" ? "New registration" : item.operation === "RENEW" ? "Renewal" : item.operation === "RESTORE" ? "Recovery" : "Transfer"}</p><p className="text-sm text-muted-foreground">{item.name} · {item.markupType === "PERCENT" ? `${item.markupValue}% profit` : `${item.markupValue} ${item.markupType === "FIXED_CUSTOMER" ? "INR" : "USD"} profit`}</p></div><div className="flex gap-2"><Button type="button" size="sm" variant="outline" onClick={() => edit(item)} disabled={mutation.pending}>Edit</Button><Button type="button" size="sm" variant="outline" onClick={() => toggle(item)} disabled={mutation.pending}>{item.active ? "Archive" : "Enable"}</Button><Button type="button" size="sm" variant="destructive" onClick={() => remove(item)} disabled={mutation.pending}>Delete</Button></div></div>)}{!policy.data?.rules.length && <p className="py-10 text-center text-sm text-muted-foreground">No special pricing rules have been created. Default pricing applies to every domain type.</p>}</div></CardContent></Card>
   </div>;
 }
 
 function OffersAndDiscounts({ token }: { token: string }) {
+  const requestConfirmation = useConfirmationDialog();
   const policy = useResource<PricingPolicy>(token, "/v1/admin/domain/pricing");
   const mutation = useMutation(token, policy.reload);
   if (policy.loading || policy.error) return <LoadState loading={policy.loading} error={policy.error} retry={policy.reload} />;
@@ -194,6 +201,10 @@ function OffersAndDiscounts({ token }: { token: string }) {
     const firstYearPrice = Number(first); const additionalYearPrice = Number(later);
     if (![firstYearPrice, additionalYearPrice].every((value) => Number.isFinite(value) && value >= 0)) return;
     void mutation.mutate(`/v1/admin/domain/pricing/campaigns/${item.campaignId}`, "PUT", { name, tlds: item.tlds, firstYearPrice, requiredYears: item.requiredYears, additionalYearPrice, eligibility: item.eligibility, perVendorLimit: item.perVendorLimit, maxRedemptions: item.maxRedemptions || null, premiumEligible: item.premiumEligible, allowLoss: item.allowLoss, maxLossPerOrder: item.maxLossPerOrder, active: item.active, startsAt: item.startsAt, endsAt: item.endsAt }, "Offer updated successfully.");
+  };
+  const remove = async (item: DomainCampaign) => {
+    if (!await requestConfirmation({ title: "Delete this offer?", description: `Permanently delete “${item.name}”? An offer that has already been used should be archived instead.`, confirmLabel: "Delete Offer", destructive: true })) return;
+    void mutation.mutate(`/v1/admin/domain/pricing/campaigns/${item.campaignId}`, "DELETE", null, "Offer deleted successfully.");
   };
   return <div className="space-y-6">
     <PageHeading title="Offers & discounts" description="Create first-year discounts that require vendors to purchase multiple years together." onRefresh={policy.reload} />
@@ -219,7 +230,7 @@ function OffersAndDiscounts({ token }: { token: string }) {
       <div className="space-y-3 rounded-md border p-4 text-sm"><label className="flex items-start gap-2"><input name="premiumEligible" type="checkbox" className="mt-1" /><span><span className="block font-medium">Include premium domains</span><span className="text-xs text-muted-foreground">Allow this offer on expensive premium domains.</span></span></label><label className="flex items-start gap-2"><input name="allowLoss" type="checkbox" className="mt-1" /><span><span className="block font-medium">Allow a controlled loss</span><span className="text-xs text-muted-foreground">Permit the final price to be below provider cost, within the limit above.</span></span></label></div>
       <div className="flex items-end"><Button className="w-full" disabled={mutation.pending}>{mutation.pending ? "Creating..." : "Create multi-year offer"}</Button></div>
     </form></CardContent></Card>
-    <Card><CardHeader><CardTitle>Saved offers</CardTitle><CardDescription>Offer eligibility is checked when the price is prepared and again before purchase.</CardDescription></CardHeader><CardContent className="overflow-x-auto"><table className="w-full min-w-4xl text-sm"><thead><tr className="border-b text-left"><th className="pb-3">Offer</th><th className="pb-3">Domain types</th><th className="pb-3">Prices</th><th className="pb-3">Required period</th><th className="pb-3">Available dates</th><th className="pb-3 text-right">Actions</th></tr></thead><tbody>{policy.data?.campaigns.map((item) => <tr key={item.campaignId} className="border-b last:border-0"><td className="py-4 font-medium">{item.name}</td><td className="py-4">{item.tlds.map((tld) => `.${tld}`).join(", ")}</td><td className="py-4">{formatDomainAmount(item.firstYearPrice, "INR")} first year · {formatDomainAmount(item.additionalYearPrice, "INR")} later</td><td className="py-4">{item.requiredYears} years</td><td className="py-4 text-muted-foreground">{formatDomainDate(item.startsAt)} – {formatDomainDate(item.endsAt)}</td><td className="py-4"><div className="flex justify-end gap-2"><Button type="button" size="sm" variant="outline" onClick={() => edit(item)} disabled={mutation.pending}>Edit</Button><Button type="button" size="sm" variant="outline" onClick={() => toggle(item)} disabled={mutation.pending}>{item.active ? "Archive" : "Enable"}</Button></div></td></tr>)}{!policy.data?.campaigns.length && <tr><td colSpan={6} className="py-12 text-center text-muted-foreground">No multi-year offers have been created.</td></tr>}</tbody></table></CardContent></Card>
+    <Card><CardHeader><CardTitle>Saved offers</CardTitle><CardDescription>Offer eligibility is checked when the price is prepared and again before purchase.</CardDescription></CardHeader><CardContent className="overflow-x-auto"><table className="w-full min-w-4xl text-sm"><thead><tr className="border-b text-left"><th className="pb-3">Offer</th><th className="pb-3">Domain types</th><th className="pb-3">Prices</th><th className="pb-3">Required period</th><th className="pb-3">Available dates</th><th className="pb-3 text-right">Actions</th></tr></thead><tbody>{policy.data?.campaigns.map((item) => <tr key={item.campaignId} className="border-b last:border-0"><td className="py-4 font-medium">{item.name}</td><td className="py-4">{item.tlds.map((tld) => `.${tld}`).join(", ")}</td><td className="py-4">{formatDomainAmount(item.firstYearPrice, "INR")} first year · {formatDomainAmount(item.additionalYearPrice, "INR")} later</td><td className="py-4">{item.requiredYears} years</td><td className="py-4 text-muted-foreground">{formatDomainDate(item.startsAt)} – {formatDomainDate(item.endsAt)}</td><td className="py-4"><div className="flex justify-end gap-2"><Button type="button" size="sm" variant="outline" onClick={() => edit(item)} disabled={mutation.pending}>Edit</Button><Button type="button" size="sm" variant="outline" onClick={() => toggle(item)} disabled={mutation.pending}>{item.active ? "Archive" : "Enable"}</Button><Button type="button" size="sm" variant="destructive" onClick={() => remove(item)} disabled={mutation.pending}>Delete</Button></div></td></tr>)}{!policy.data?.campaigns.length && <tr><td colSpan={6} className="py-12 text-center text-muted-foreground">No multi-year offers have been created.</td></tr>}</tbody></table></CardContent></Card>
   </div>;
 }
 

@@ -97,6 +97,7 @@ const adminNavigation = [
 const operationsNavigation = [
   { label: "Domain catalogue", href: "/admin/operations/catalogue" },
   { label: "Credit activity", href: "/admin/operations/wallet-ledger" },
+  { label: "Provider transactions", href: "/admin/operations/provider-transactions" },
   { label: "Search activity", href: "/admin/operations/search-activity" },
   { label: "Audit log", href: "/admin/operations/audit-logs" },
 ];

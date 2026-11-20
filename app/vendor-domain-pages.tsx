@@ -22,6 +22,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { useConfirmationDialog } from "@/components/ui/confirmation-dialog";
 import { createIdempotencyKey, domainApi, domainNdjsonStream, DomainApiError, formatDomainAmount, formatDomainDate } from "@/lib/domain-api";
 import { useDomainResource } from "@/lib/domain-resource";
 import { boundedSearchSignal, domainSearchRank, isCurrentDomainSearch, isSuggestionCheckFailed, isVerifiedAvailable, shouldStartDomainSearch } from "@/lib/domain-search-state";
@@ -872,15 +873,163 @@ export function DnsRecords({ token, domainName }: { token: string; domainName?: 
 }
 
 function DnsZone({ token, domainName }: { token: string; domainName: string }) {
-  const records = useResource<{ records: Array<Record<string, unknown>> }>(token, `/v1/domain/domains/${encodeURIComponent(domainName)}/dns`); const [name, setName] = useState(""); const [type, setType] = useState("A"); const [ttl, setTtl] = useState(300); const [value, setValue] = useState(""); const [pending, setPending] = useState(false); const [error, setError] = useState("");
-  const add = async (event: FormEvent) => { event.preventDefault(); setPending(true); setError(""); try { await domainApi(token, `/v1/domain/domains/${encodeURIComponent(domainName)}/dns`, { method: "POST", body: JSON.stringify({ zoneStruct: { name, type, ttl, contents: [value] } }) }); records.reload(); setValue(""); } catch (cause) { setError(cause instanceof Error ? cause.message : "Unable to add DNS record."); } finally { setPending(false); } };
-  const apply = async () => { setPending(true); setError(""); try { await domainApi(token, `/v1/domain/domains/${encodeURIComponent(domainName)}/dns/apply`, { method: "POST" }); records.reload(); } catch (cause) { setError(cause instanceof Error ? cause.message : "Unable to publish DNS zone."); } finally { setPending(false); } };
-  const remove = async (recordName: string, recordType: string, record: string) => { setPending(true); setError(""); try { await domainApi(token, `/v1/domain/domains/${encodeURIComponent(domainName)}/dns`, { method: "DELETE", body: JSON.stringify({ name: recordName, recordType, record }) }); records.reload(); } catch (cause) { setError(cause instanceof Error ? cause.message : "Unable to delete DNS record."); } finally { setPending(false); } };
+  const requestConfirmation = useConfirmationDialog();
+  type EditableRecord = { recordName: string; contents: string[]; contentIndex: number };
+  const records = useResource<{ records: Array<Record<string, unknown>> }>(token, `/v1/domain/domains/${encodeURIComponent(domainName)}/dns`);
+  const [name, setName] = useState("");
+  const [type, setType] = useState("A");
+  const [ttl, setTtl] = useState(300);
+  const [value, setValue] = useState("");
+  const [editing, setEditing] = useState<EditableRecord | null>(null);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
+
+  const resetForm = () => {
+    setName("");
+    setType("A");
+    setTtl(300);
+    setValue("");
+    setEditing(null);
+  };
+
+  const save = async (event: FormEvent) => {
+    event.preventDefault();
+    setPending(true);
+    setError("");
+    setMessage("");
+    const contents = editing
+      ? editing.contents.map((item, index) => index === editing.contentIndex ? value : item)
+      : [value];
+    try {
+      await domainApi(token, `/v1/domain/domains/${encodeURIComponent(domainName)}/dns`, {
+        method: editing ? "PUT" : "POST",
+        body: JSON.stringify(editing
+          ? { recordName: editing.recordName || "@", zoneStruct: { name: name.trim(), type, ttl, contents } }
+          : { zoneStruct: { name: name.trim(), type, ttl, contents } }),
+      });
+      setMessage(editing
+        ? "DNS record updated successfully. Publish the records to apply your changes."
+        : "DNS record added successfully. Publish the records to apply your changes.");
+      resetForm();
+      records.reload();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : editing
+        ? "Unable to update this DNS record."
+        : "Unable to add this DNS record.");
+    } finally {
+      setPending(false);
+    }
+  };
+
+  const apply = async () => {
+    setPending(true);
+    setError("");
+    setMessage("");
+    try {
+      await domainApi(token, `/v1/domain/domains/${encodeURIComponent(domainName)}/dns/apply`, { method: "POST" });
+      setMessage("DNS records were published successfully. Changes may take some time to appear everywhere.");
+      records.reload();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Unable to publish DNS records.");
+    } finally {
+      setPending(false);
+    }
+  };
+
+  const remove = async (recordName: string, recordType: string, record: string) => {
+    if (!await requestConfirmation({ title: `Delete this ${recordType} record?`, description: "This change takes effect after the DNS records are published.", confirmLabel: "Delete Record", destructive: true })) return;
+    setPending(true);
+    setError("");
+    setMessage("");
+    try {
+      await domainApi(token, `/v1/domain/domains/${encodeURIComponent(domainName)}/dns`, {
+        method: "DELETE",
+        body: JSON.stringify({ name: recordName || "@", recordType, record }),
+      });
+      if (editing?.recordName === (recordName || "@")) resetForm();
+      setMessage("DNS record deleted successfully. Publish the records to apply your changes.");
+      records.reload();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Unable to delete this DNS record.");
+    } finally {
+      setPending(false);
+    }
+  };
+
   const zoneRows = (records.data?.records || []).flatMap((record) => {
-    const values = Array.isArray(record.contents) ? record.contents : [record.content ?? record.value].filter(Boolean);
-    return values.map((content) => ({ name: String(record.name ?? ""), type: String(record.type ?? record.recordType ?? ""), ttl: Number(record.ttl || 0), content: String(content) }));
+    const values = (Array.isArray(record.contents)
+      ? record.contents
+      : [record.content ?? record.value].filter(Boolean)).map(String);
+    return values.map((content, contentIndex) => ({
+      name: String(record.name ?? ""),
+      type: String(record.type ?? record.recordType ?? ""),
+      ttl: Number(record.ttl || 0),
+      content,
+      contents: values,
+      contentIndex,
+    }));
   });
-  return <div className="space-y-6"><PageHeading title={`DNS Records · ${domainName}`} description="Connect your domain to websites, email and other services." action={<Button variant="outline" asChild><Link href="/dns">Change domain</Link></Button>} />{(error || records.error) && <ErrorState message={error || records.error} retry={records.reload} />}<Card><CardHeader><CardTitle>Add DNS record</CardTitle><CardDescription>Add A, CNAME, MX, TXT or other supported records.</CardDescription></CardHeader><CardContent><form className="grid gap-3 sm:grid-cols-5" onSubmit={add}><Input value={name} onChange={(event) => setName(event.target.value)} required placeholder="Name" /><select className="h-9 rounded-md border bg-transparent px-3 text-sm" value={type} onChange={(event) => setType(event.target.value)}>{["A", "AAAA", "CNAME", "MX", "TXT", "CAA"].map((item) => <option key={item}>{item}</option>)}</select><Input type="number" min={1} max={86400} value={ttl} onChange={(event) => setTtl(Number(event.target.value))} /><Input value={value} onChange={(event) => setValue(event.target.value)} required placeholder="Value" /><Button disabled={pending}>Add record</Button></form></CardContent></Card><Card><CardHeader className="flex flex-row items-center justify-between"><div><CardTitle>DNS records</CardTitle><CardDescription>Publish after completing your changes.</CardDescription></div><Button onClick={apply} disabled={pending}>Publish records</Button></CardHeader><CardContent>{records.loading ? <LoadingState /> : zoneRows.length ? <div className="overflow-x-auto"><table className="w-full min-w-2xl text-sm"><thead><tr className="border-b text-left"><th className="pb-3">Name</th><th className="pb-3">Type</th><th className="pb-3">TTL</th><th className="pb-3">Value</th><th /></tr></thead><tbody>{zoneRows.map((record, index) => <tr key={`${record.name}-${record.type}-${record.content}-${index}`} className="border-b last:border-0"><td className="py-3 font-medium">{record.name || "@"}</td><td className="py-3"><Badge variant="outline">{record.type}</Badge></td><td className="py-3">{record.ttl || "—"}</td><td className="max-w-sm break-all py-3 font-mono text-xs">{record.content}</td><td className="py-3 text-right"><Button size="sm" variant="outline" disabled={pending} onClick={() => remove(record.name, record.type, record.content)}>Delete</Button></td></tr>)}</tbody></table></div> : <EmptyState title="No DNS records" description="Add the first record to create this domain's DNS zone." />}</CardContent></Card></div>;
+
+  const startEdit = (record: typeof zoneRows[number]) => {
+    setEditing({ recordName: record.name || "@", contents: record.contents, contentIndex: record.contentIndex });
+    setName(record.name || "@");
+    setType(record.type);
+    setTtl(record.ttl || 300);
+    setValue(record.content);
+    setError("");
+    setMessage("");
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
+  const recordTypes = [...new Set(["A", "AAAA", "CNAME", "MX", "TXT", "CAA", "NS", "SRV", type])];
+
+  return <div className="space-y-6">
+    <PageHeading title={`DNS Records · ${domainName}`} description="Connect your domain to websites, email and other services." action={<Button variant="outline" asChild><Link href="/dns">Change domain</Link></Button>} />
+    {(error || records.error) && <ErrorState message={error || records.error} retry={records.reload} />}
+    {message && <div className="rounded-lg border border-primary/40 bg-primary/10 p-4 text-sm">{message}</div>}
+    <Card>
+      <CardHeader>
+        <CardTitle>{editing ? "Edit DNS record" : "Add DNS record"}</CardTitle>
+        <CardDescription>{editing ? "Update the selected record, then publish your changes." : "Add A, CNAME, MX, TXT or other supported records."}</CardDescription>
+      </CardHeader>
+      <CardContent>
+        <form className="grid gap-3 sm:grid-cols-5" onSubmit={save}>
+          <Input aria-label="Record name" value={name} onChange={(event) => setName(event.target.value)} required placeholder="Name or @" />
+          <select aria-label="Record type" className="h-9 rounded-md border bg-transparent px-3 text-sm" value={type} onChange={(event) => setType(event.target.value)}>{recordTypes.map((item) => <option key={item}>{item}</option>)}</select>
+          <Input aria-label="TTL" type="number" min={1} max={86400} value={ttl} onChange={(event) => setTtl(Number(event.target.value))} />
+          <Input aria-label="Record value" value={value} onChange={(event) => setValue(event.target.value)} required placeholder="Value" />
+          <div className="flex gap-2">
+            <Button disabled={pending}>{editing ? "Save Changes" : "Add Record"}</Button>
+            {editing && <Button type="button" variant="outline" disabled={pending} onClick={resetForm}>Cancel</Button>}
+          </div>
+        </form>
+      </CardContent>
+    </Card>
+    <Card>
+      <CardHeader className="flex flex-row items-center justify-between">
+        <div><CardTitle>DNS records</CardTitle><CardDescription>Publish after completing your changes.</CardDescription></div>
+        <Button onClick={apply} disabled={pending}>Publish Records</Button>
+      </CardHeader>
+      <CardContent>
+        {records.loading ? <LoadingState /> : zoneRows.length ? <div className="overflow-x-auto">
+          <table className="w-full min-w-2xl text-sm">
+            <thead><tr className="border-b text-left"><th className="pb-3">Name</th><th className="pb-3">Type</th><th className="pb-3">TTL</th><th className="pb-3">Value</th><th className="pb-3 text-right">Actions</th></tr></thead>
+            <tbody>{zoneRows.map((record, index) => <tr key={`${record.name}-${record.type}-${record.content}-${index}`} className="border-b last:border-0">
+              <td className="py-3 font-medium">{record.name || "@"}</td>
+              <td className="py-3"><Badge variant="outline">{record.type}</Badge></td>
+              <td className="py-3">{record.ttl || "—"}</td>
+              <td className="max-w-sm break-all py-3 font-mono text-xs">{record.content}</td>
+              <td className="py-3"><div className="flex justify-end gap-2">
+                <Button type="button" size="sm" variant="outline" disabled={pending} onClick={() => startEdit(record)}>Edit</Button>
+                <Button type="button" size="sm" variant="outline" disabled={pending} onClick={() => remove(record.name, record.type, record.content)}>Delete</Button>
+              </div></td>
+            </tr>)}</tbody>
+          </table>
+        </div> : <EmptyState title="No DNS records" description="Add the first record to create this domain's DNS zone." />}
+      </CardContent>
+    </Card>
+  </div>;
 }
 
 function findContactHandles(value: unknown, found = new Set<string>(), depth = 0): Set<string> {
