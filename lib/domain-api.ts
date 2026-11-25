@@ -20,6 +20,8 @@ const friendlyErrorByCode: Record<string, string> = {
   INSUFFICIENT_DOMAIN_CREDITS: "You do not have enough credits for this action. Add credits and try again.",
   DOMAIN_NOT_FOUND: "This domain is not available in your account.",
   DOMAIN_CONTACT_NOT_FOUND: "This contact is not linked to the selected domain.",
+  DOMAIN_PRIVACY_UNAVAILABLE: "Contact privacy is not supported for this domain extension.",
+  DOMAIN_PRIVACY_SUPPORT_UNKNOWN: "Contact privacy availability could not be verified. Please try again later.",
   DOMAIN_NOTIFICATION_NOT_FOUND: "This notification is no longer available.",
   DOMAIN_SERVICE_UNREACHABLE: "The domain service is temporarily unavailable. Please try again shortly.",
 };

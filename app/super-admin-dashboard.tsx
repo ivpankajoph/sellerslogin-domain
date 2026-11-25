@@ -164,20 +164,26 @@ export function SuperAdminDashboard({
     Promise.allSettled([
       read<DashboardData>("/v1/admin/domain/dashboard"),
       read<{ items: DomainOrder[] }>("/v1/admin/domain/orders?page=1&limit=5"),
+      read<{ total: number }>("/v1/admin/domain/orders?page=1&limit=1&status=RESERVING"),
+      read<{ total: number }>("/v1/admin/domain/orders?page=1&limit=1&status=RESERVED"),
       read<{ total: number }>("/v1/admin/domain/orders?page=1&limit=1&status=PROVIDER_PENDING"),
       read<{ total: number }>("/v1/admin/domain/orders?page=1&limit=1&status=RECONCILIATION_REQUIRED"),
     ])
-      .then(([dashboardResult, ordersResult, pendingResult, reconciliationResult]) => {
+      .then(([dashboardResult, ordersResult, reservingResult, reservedResult, pendingResult, reconciliationResult]) => {
         if (!active) return;
         if (dashboardResult.status === "fulfilled") setDashboard(dashboardResult.value);
         if (ordersResult.status === "fulfilled") setRecentOrders(Array.isArray(ordersResult.value?.items) ? ordersResult.value.items : []);
+        const reserving = reservingResult.status === "fulfilled" ? Number(reservingResult.value.total || 0) : 0;
+        const reserved = reservedResult.status === "fulfilled" ? Number(reservedResult.value.total || 0) : 0;
         const providerPending = pendingResult.status === "fulfilled" ? Number(pendingResult.value.total || 0) : 0;
         const reconciliation = reconciliationResult.status === "fulfilled" ? Number(reconciliationResult.value.total || 0) : 0;
-        if (pendingResult.status === "fulfilled" || reconciliationResult.status === "fulfilled") setPendingOrders(providerPending + reconciliation);
+        if ([reservingResult, reservedResult, pendingResult, reconciliationResult].some((result) => result.status === "fulfilled")) {
+          setPendingOrders(reserving + reserved + providerPending + reconciliation);
+        }
         if (reconciliationResult.status === "fulfilled") setReconciliationOrders(reconciliation);
         if (dashboardResult.status === "fulfilled") {
           setLoadError("");
-        } else if ([dashboardResult, ordersResult, pendingResult, reconciliationResult].every((result) => result.status === "rejected")) {
+        } else if ([dashboardResult, ordersResult, reservingResult, reservedResult, pendingResult, reconciliationResult].every((result) => result.status === "rejected")) {
           setLoadError("Live administration data is temporarily unavailable.");
         }
       })
