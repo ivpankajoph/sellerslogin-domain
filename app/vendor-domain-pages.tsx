@@ -234,7 +234,6 @@ export function VendorOverview({ token }: { token: string }) {
     { label: "Owned domains", value: stats?.total, description: "Domains in your account", icon: Globe2 },
     { label: "Expiring soon", value: stats?.expiringSoon, description: "Within the next 60 days", icon: Clock3 },
     { label: "Need attention", value: stats?.actionRequired, description: "Domains waiting for an action", icon: RefreshCcw },
-    { label: "Wallet balance", value: wallet ? `${wallet.availableCredits.toLocaleString("en-IN")} ${wallet.currency}` : null, description: wallet ? `${wallet.reservedCredits.toLocaleString("en-IN")} reserved` : "Available credits", icon: WalletCards },
   ];
   return <div className="space-y-6">
     <PageHeading title="Domain Dashboard" description="Live overview of your domains, renewals, orders and wallet." action={<Button asChild><Link href="/search"><Search />Search a domain</Link></Button>} />
@@ -805,8 +804,8 @@ export function Renewals({ token }: { token: string }) {
   const checkoutKeys = useRef(new Map<string, string>());
 
   const selectDomain = (item: RenewalItem) => {
-    const periods = item.renewalPeriods.length ? item.renewalPeriods : [1];
-    setSelected(item); setQuote(null); setError(""); setMessage("");
+    const periods = [...(item.renewalPeriods.length ? item.renewalPeriods : [1])].sort((a, b) => a - b);
+    setSelected({ ...item, renewalPeriods: periods }); setQuote(null); setError(""); setMessage("");
     setPeriod(periods.includes(1) ? 1 : periods[0]);
     setAction(item.lifecycle.canRestore ? "RESTORE" : "RENEW");
   };
